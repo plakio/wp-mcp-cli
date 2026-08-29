@@ -955,7 +955,7 @@ wpmcp_url_path_encode() {
 # wp-mcp-cli version reporting.
 
 wpmcp_version_print() {
-    echo "$WPMCP_NAME $WPMCP_VERSION"
+    echo "$WPMCP_NAME v$WPMCP_VERSION"
 }
 
 wpmcp_version_json() {

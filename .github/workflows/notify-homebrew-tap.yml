@@ -36,5 +36,6 @@ jobs:
           VERSION="v${VERSION#v}"
           jq -n \
             --arg version "$VERSION" \
-            '{event_type: "new-release", client_payload: {version: $version}}' \
+            --arg formula "wp-mcp-cli" \
+            '{event_type: "new-release", client_payload: {version: $version, formula: $formula}}' \
             | gh api --method POST repos/plakio/homebrew-tap/dispatches --input -
