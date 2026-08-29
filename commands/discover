@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# wp-mcp discover
+# Lists every ability registered on the active site that exposes
+# show_in_rest=true via the WordPress core abilities REST namespace.
+
+wpmcp_discover() {
+    wpmcp_auth_require
+
+    local rest_url
+    rest_url=$(wpmcp_rest_url_for "/wp-abilities/v1/abilities")
+
+    local page=1
+    local all_abilities="[]"
+    while :; do
+        local url="${rest_url}?per_page=100&page=${page}"
+        local raw
+        raw=$(wpmcp_http_get "$url")
+        local rc=$?
+        if [ $rc -ne 0 ]; then
+            wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
+                "Failed to fetch $url (curl exit $rc)"
+        fi
+        wpmcp_http_split "$raw"
+        if [ "${WPMCP_HTTP_STATUS:-000}" -ge 400 ]; then
+            wpmcp_http_classify_wp_error "$WPMCP_HTTP_BODY"
+        fi
+        local body
+        body=$(printf '%s' "$WPMCP_HTTP_BODY" | jq -c '. // []')
+        local n
+        n=$(printf '%s' "$body" | jq 'length')
+        if [ "$n" -eq 0 ]; then
+            break
+        fi
+        all_abilities=$(jq -nc --argjson a "$all_abilities" --argjson b "$body" '$a + $b')
+        if [ "$n" -lt 100 ]; then
+            break
+        fi
+        page=$((page + 1))
+        if [ "$page" -gt 1000 ]; then
+            wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                "Aborting pagination after 1000 pages"
+        fi
+    done
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        jq -nc \
+            --argjson abilities "$all_abilities" \
+            --arg site "$WPMCP_ACTIVE_SITE" \
+            --arg origin "$WPMCP_ACTIVE_ORIGIN" \
+            '{ok:true,data:{abilities:$abilities},meta:{site:$site,origin:$origin,count:($abilities|length)}}'
+        return 0
+    fi
+
+    if wpmcp_has_tty; then
+        local tsv="Name\tLabel\tCategory\tReadonly\tDestructive"
+        local labels
+        labels=$(printf '%s' "$all_abilities" | jq -r '.[] | [.name, (.label // ""), (.category // ""), (.meta.annotations.readonly // false|tostring), (.meta.annotations.destructive // false|tostring)] | @tsv')
+        if [ -n "$labels" ]; then
+            tsv="${tsv}
+${labels}"
+        fi
+        wpmcp_ui_table "$tsv" "Name,Label,Category,Readonly,Destructive"
+    else
+        printf '%s' "$all_abilities" | jq -r '.[] | "\(.name)\t\(.label // "")\t\(.category // "")"'
+    fi
+}

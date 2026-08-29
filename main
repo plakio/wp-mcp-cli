@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+
+# wp-mcp - Bash entrypoint
+# Source file for the compiled wp-mcp.sh distribution script.
+
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -euo pipefail
+
+WPMCP_NAME="wp-mcp"
+WPMCP_VERSION="0.1.0"
+WPMCP_HOME="${WPMCP_HOME:-$HOME/.wp-mcp}"
+
+# Ensure common user-managed binary locations are available when launched
+# from restricted environments such as cron, launchd, or GUI shells.
+for _wpmcp_bin in /opt/homebrew/bin /usr/local/bin /usr/local/sbin "$HOME/.local/bin"; do
+    if [ -d "$_wpmcp_bin" ] && [[ ":$PATH:" != *":$_wpmcp_bin:"* ]]; then
+        PATH="$_wpmcp_bin:$PATH"
+    fi
+done
+unset _wpmcp_bin
+export PATH
+
+wpmcp_setup_environment() {
+    local os_name
+    os_name=$(uname -s)
+
+    case "$os_name" in
+        Darwin) WPMCP_OS="macos" ;;
+        Linux)  WPMCP_OS="linux" ;;
+        *)      WPMCP_OS="unsupported" ;;
+    esac
+
+    export WPMCP_OS
+}
+
+wpmcp_command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+wpmcp_has_tty() {
+    [ -t 0 ] && [ -t 1 ]
+}
+
+wpmcp_require_command() {
+    if ! wpmcp_command_exists "$1"; then
+        echo "Error: '$1' is required for this command." >&2
+        echo "Install it and ensure it is on your PATH." >&2
+        exit 1
+    fi
+}
+
+wpmcp_require_gum() {
+    wpmcp_require_command gum
+    if ! wpmcp_has_tty; then
+        echo "Error: this command needs an interactive terminal." >&2
+        exit 1
+    fi
+}
+
+wpmcp_require_jq() {
+    wpmcp_require_command jq
+}
+
+wpmcp_require_curl() {
+    wpmcp_require_command curl
+}
+
+wpmcp_show_help() {
+    cat <<'HELP'
+wp-mcp CLI
+
+Usage:
+  wp-mcp <command> [arguments]
+
+Commands:
+  auth        Authenticate against a WP-MCP site
+  sites       Manage saved site profiles
+  discover    List available abilities on the active site
+  describe    Show an ability's schema and metadata
+  run         Execute an ability on the active site
+  doctor      Diagnose wp-mcp-cli and target site connectivity
+  skill       Install the wp-mcp agent skill
+  version     Show wp-mcp-cli version
+  help        Show this help
+
+Global flags (must appear before the command):
+  --json              Force JSON output for commands that support it
+  --quiet             Suppress success output on STDOUT
+  --site <name>       Override the active site profile (or set WPMCP_SITE)
+  --version           Show wp-mcp-cli version
+  --help              Show help for any command
+
+Selection order for the active site:
+  1. --site <name>
+  2. WPMCP_SITE environment variable
+  3. The single configured profile (implicit)
+  4. Error: site_required (when multiple profiles exist without a selector)
+
+Examples:
+  wp-mcp auth login
+  wp-mcp --json sites list
+  wp-mcp --json discover
+  wp-mcp describe wp-mcp/list-directory
+  wp-mcp run wp-mcp/list-directory --input '{"path":"/Users"}'
+  wp-mcp --json doctor
+
+HELP
+}
+
+wpmcp_display_command_help() {
+    local command="${1:-}"
+
+    case "$command" in
+        auth)
+            cat <<'HELP'
+Usage:
+  wp-mcp auth <action> [args]
+
+Actions:
+  login [<url>] [--name <name>]    Save credentials for a WP-MCP site
+  status                            Show the active profile and credential summary
+  logout                            Remove credentials for the active site
+  help                              Show this help
+
+Auth uses WordPress Application Passwords (HTTP Basic). No browser flow is
+required. Generate an application password from the WP-MCP → Configuration
+admin page in your WordPress dashboard.
+HELP
+            ;;
+        sites)
+            cat <<'HELP'
+Usage:
+  wp-mcp sites <action> [args]
+
+Actions:
+  list                              List saved site profiles (or use --json)
+  remove <name> [--yes]             Remove a saved site profile and its credentials
+  rename <name> <new-name>          Rename a profile and migrate its credentials
+  help                              Show this help
+HELP
+            ;;
+        discover)
+            cat <<'HELP'
+Usage:
+  wp-mcp discover [--site <name>]
+
+Lists every ability registered on the active site that exposes
+show_in_rest=true. Use --json for a stable machine-readable envelope.
+HELP
+            ;;
+        describe)
+            cat <<'HELP'
+Usage:
+  wp-mcp describe <ability> [--site <name>]
+
+Prints the ability record including input_schema, output_schema, and
+annotations (readonly, destructive, idempotent).
+HELP
+            ;;
+        run)
+            cat <<'HELP'
+Usage:
+  wp-mcp run <ability> [--input <json|@file|->] [--site <name>] [--yes]
+
+The --input flag accepts:
+  - inline JSON string
+  - @<path>         read JSON from a file
+  - "-"             read JSON from STDIN
+  - omitted         input defaults to null
+
+Use --yes to skip the destructive-operation prompt. Use --json for a
+stable envelope on STDOUT.
+HELP
+            ;;
+        doctor)
+            cat <<'HELP'
+Usage:
+  wp-mcp doctor [--site <name>] [--offline]
+
+Runs ordered health checks against the CLI environment and the target
+site. --offline skips network calls.
+HELP
+            ;;
+        skill)
+            cat <<'HELP'
+Usage:
+  wp-mcp skill install [codex|claude-code|opencode|hermes|pi|global|all]
+
+Installs the wp-mcp agent skill to the requested agent's skills directory.
+"all" installs agent-specific targets only (codex, claude-code, opencode,
+hermes, pi). Use "global" to install into ~/.agents/skills/ explicitly.
+HELP
+            ;;
+        version)
+            echo "Usage: wp-mcp version"
+            ;;
+        *)
+            wpmcp_show_help
+            ;;
+    esac
+}
+
+main() {
+    wpmcp_setup_environment
+
+    WPMCP_QUIET=0
+    WPMCP_JSON=0
+    WPMCP_SITE_FLAG=""
+    WPMCP_VERSION_REQUEST=0
+    local new_args=()
+
+    # Strip global flags first. --json / --quiet / --site are handled via
+    # env vars so commands never see them and don't need to special-case
+    # them in their own flag parsers.
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --json)
+                WPMCP_JSON=1
+                shift
+                ;;
+            --quiet|-q)
+                WPMCP_QUIET=1
+                shift
+                ;;
+            --site)
+                if [ -n "${2:-}" ]; then
+                    WPMCP_SITE_FLAG="$2"
+                    shift 2
+                else
+                    wpmcp_error_usage "--site requires a profile name"
+                fi
+                ;;
+            --site=*)
+                WPMCP_SITE_FLAG="${1#--site=}"
+                shift
+                ;;
+            --version)
+                WPMCP_VERSION_REQUEST=1
+                shift
+                ;;
+            --help|-h)
+                # Defer to the command so it can show focused help.
+                new_args+=("--help")
+                shift
+                ;;
+            *)
+                new_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    export WPMCP_QUIET WPMCP_JSON
+    if [ -n "$WPMCP_SITE_FLAG" ]; then
+        export WPMCP_SITE
+        WPMCP_SITE="$WPMCP_SITE_FLAG"
+    fi
+
+    if [ "$WPMCP_VERSION_REQUEST" = "1" ]; then
+        wpmcp_version
+        exit 0
+    fi
+
+    set -- "${new_args[@]}"
+
+    local command="${1:-help}"
+    if [ "$#" -gt 0 ]; then
+        shift
+    fi
+
+    case "$command" in
+        auth)
+            wpmcp_auth "$@"
+            ;;
+        sites)
+            wpmcp_sites "$@"
+            ;;
+        discover)
+            wpmcp_discover "$@"
+            ;;
+        describe)
+            wpmcp_describe "$@"
+            ;;
+        run)
+            wpmcp_run "$@"
+            ;;
+        doctor)
+            wpmcp_doctor "$@"
+            ;;
+        skill)
+            wpmcp_skill "$@"
+            ;;
+        version|-v)
+            wpmcp_version "$@"
+            ;;
+        help)
+            wpmcp_show_help
+            ;;
+        *)
+            echo "Error: unknown command '$command'" >&2
+            echo ""
+            wpmcp_show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

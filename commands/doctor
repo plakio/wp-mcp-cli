@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# wp-mcp doctor [--offline]
+# Ordered health checks against the CLI environment and the target site.
+
+wpmcp_doctor() {
+    local offline=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --offline) offline=1; shift ;;
+            --help|-h) wpmcp_display_command_help doctor; return 0 ;;
+            *) wpmcp_error_usage "Unknown doctor flag: $1" ;;
+        esac
+    done
+
+    local results=()
+    local failed=0
+
+    check() {
+        local name="$1"; shift
+        local ok=0
+        local detail=""
+        if "$@"; then ok=1; else ok=0; fi
+        if [ $ok -eq 1 ]; then
+            results+=("OK|$name|$detail")
+        else
+            results+=("FAIL|$name|$detail")
+            failed=$((failed + 1))
+        fi
+    }
+
+    check "bash >= 4"            wpmcp_check_bash_version
+    check "jq available"         wpmcp_check_jq
+    check "curl available"       wpmcp_check_curl
+    check "gum available"        wpmcp_check_gum
+    check "config dir writable"  wpmcp_check_config_dir
+
+    if [ "$offline" = "0" ]; then
+        check "active site resolvable" wpmcp_check_active_site
+        check "credentials present"    wpmcp_check_credentials
+        check "site reachable"         wpmcp_check_site_reachable
+    fi
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        local arr="[]"
+        local r
+        for r in "${results[@]}"; do
+            IFS='|' read -r status name detail <<< "$r"
+            arr=$(echo "$arr" | jq -c \
+                --arg status "$status" \
+                --arg name "$name" \
+                --arg detail "$detail" \
+                '. + [{status:$status,name:$name,detail:$detail}]')
+        done
+        jq -nc \
+            --argjson checks "$arr" \
+            --argjson ok "$([[ $failed -eq 0 ]] && echo true || echo false)" \
+            '{ok:$ok,data:{checks:$checks,failed:('$failed')},meta:{}}'
+    else
+        echo "wp-mcp doctor"
+        echo "============"
+        local r
+        for r in "${results[@]}"; do
+            IFS='|' read -r status name detail <<< "$r"
+            if [ "$status" = "OK" ]; then
+                echo "  OK    $name"
+            else
+                echo "  FAIL  $name"
+            fi
+        done
+    fi
+
+    return $failed
+}
+
+wpmcp_check_bash_version() {
+    [ "${BASH_VERSINFO[0]}" -ge 4 ]
+}
+
+wpmcp_check_jq() {
+    wpmcp_command_exists jq
+}
+
+wpmcp_check_curl() {
+    wpmcp_command_exists curl
+}
+
+wpmcp_check_gum() {
+    wpmcp_command_exists gum
+}
+
+wpmcp_check_config_dir() {
+    wpmcp_paths_ensure
+    [ -d "$WPMCP_HOME" ] && [ -w "$WPMCP_HOME" ]
+}
+
+wpmcp_check_active_site() {
+    # Tolerates "site_required" because that means no profiles yet.
+    if [ -z "${WPMCP_ACTIVE_SITE:-}" ]; then
+        wpmcp_config_resolve_site 2>/dev/null
+    fi
+    [ -n "${WPMCP_ACTIVE_SITE:-}" ]
+}
+
+wpmcp_check_credentials() {
+    [ -n "${WPMCP_ACTIVE_SITE:-}" ] && wpmcp_auth_check "$WPMCP_ACTIVE_SITE"
+}
+
+wpmcp_check_site_reachable() {
+    local site_url
+    site_url=$(wpmcp_config_get_profile "${WPMCP_ACTIVE_SITE:-}" | jq -r '.siteUrl // empty')
+    if [ -z "$site_url" ]; then return 1; fi
+    local url="${site_url%/}/wp-json/"
+    local raw
+    raw=$(curl -fsSL --max-time 5 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+    [ "${raw:-000}" -lt 500 ]
+}

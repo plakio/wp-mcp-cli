@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# wp-mcp sites list | remove | rename
+
+wpmcp_sites() {
+    local action="${1:-list}"
+    [ "$#" -gt 0 ] && shift
+
+    case "$action" in
+        list|ls)
+            wpmcp_sites_list "$@"
+            ;;
+        remove|rm)
+            wpmcp_sites_remove "$@"
+            ;;
+        rename|mv)
+            wpmcp_sites_rename "$@"
+            ;;
+        help|--help|-h)
+            wpmcp_display_command_help sites
+            ;;
+        *)
+            wpmcp_error_usage "Unknown sites action: $action"
+            ;;
+    esac
+}
+
+wpmcp_sites_list() {
+    local config
+    config=$(wpmcp_config_load)
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        echo "$config" | jq -c '{ok:true,data:[.profiles | to_entries[] | {name:.key,siteUrl:.value.siteUrl,origin:.value.origin,defaultUser:.value.defaultUser}],meta:{}}'
+        return 0
+    fi
+
+    local names
+    names=$(echo "$config" | jq -r '.profiles | keys[]')
+    if [ -z "$names" ]; then
+        echo "No site profiles configured. Run: wp-mcp auth login <url>"
+        return 0
+    fi
+
+    if wpmcp_has_tty; then
+        local tsv="Name\tURL\tUser"
+        while IFS= read -r n; do
+            [ -z "$n" ] && continue
+            local url user
+            url=$(echo "$config" | jq -r --arg n "$n" '.profiles[$n].siteUrl // ""')
+            user=$(echo "$config" | jq -r --arg n "$n" '.profiles[$n].defaultUser // ""')
+            tsv="${tsv}
+${n}\t${url}\t${user}"
+        done <<< "$names"
+        wpmcp_ui_table "$tsv" "Name,URL,User"
+    else
+        while IFS= read -r n; do
+            [ -z "$n" ] && continue
+            local url user
+            url=$(echo "$config" | jq -r --arg n "$n" '.profiles[$n].siteUrl // ""')
+            user=$(echo "$config" | jq -r --arg n "$n" '.profiles[$n].defaultUser // ""')
+            printf '%s\t%s\t%s\n' "$n" "$url" "$user"
+        done <<< "$names"
+    fi
+}
+
+wpmcp_sites_remove() {
+    local name=""
+    local yes=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --yes|-y) yes=1; shift ;;
+            --help|-h) wpmcp_display_command_help sites; return 0 ;;
+            *)
+                if [ -z "$name" ]; then name="$1"; shift
+                else wpmcp_error_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -z "$name" ]; then
+        wpmcp_error_usage "Usage: wp-mcp sites remove <name> [--yes]"
+    fi
+
+    local exists
+    exists=$(wpmcp_config_load | jq -r --arg n "$name" '(.profiles[$n] // null) | type')
+    if [ "$exists" != '"object"' ]; then
+        wpmcp_error_usage "Site profile '$name' not found."
+    fi
+
+    if [ "$yes" != "1" ] && [ "$WPMCP_JSON" != "1" ]; then
+        if ! wpmcp_ui_confirm "Remove profile '$name' and its credentials?"; then
+            echo "Cancelled."
+            return 0
+        fi
+    fi
+
+    wpmcp_config_remove_profile "$name" >/dev/null
+    wpmcp_auth_remove "$name"
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        jq -nc --arg n "$name" '{ok:true,data:{name:$n,removed:true},meta:{}}'
+    else
+        echo "Removed site profile '$name'"
+    fi
+}
+
+wpmcp_sites_rename() {
+    local old_name="" new_name=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --help|-h) wpmcp_display_command_help sites; return 0 ;;
+            *)
+                if [ -z "$old_name" ]; then old_name="$1"; shift
+                elif [ -z "$new_name" ]; then new_name="$1"; shift
+                else wpmcp_error_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -z "$old_name" ] || [ -z "$new_name" ]; then
+        wpmcp_error_usage "Usage: wp-mcp sites rename <name> <new-name>"
+    fi
+
+    local config
+    config=$(wpmcp_config_load)
+    local exists
+    exists=$(echo "$config" | jq -r --arg n "$old_name" '(.profiles[$n] // null) | type')
+    if [ "$exists" != '"object"' ]; then
+        wpmcp_error_usage "Site profile '$old_name' not found."
+    fi
+
+    config=$(echo "$config" | jq \
+        --arg old "$old_name" --arg new "$new_name" \
+        '.profiles[$new] = .profiles[$old] | del(.profiles[$old])')
+    echo "$config" | wpmcp_config_save_stdin
+
+    # Migrate credentials file.
+    local old_cred new_cred
+    old_cred=$(wpmcp_auth_cred_path "$old_name")
+    new_cred=$(wpmcp_auth_cred_path "$new_name")
+    if [ -f "$old_cred" ]; then
+        mv -f "$old_cred" "$new_cred"
+    fi
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        jq -nc --arg old "$old_name" --arg new "$new_name" \
+            '{ok:true,data:{old:$old,new:$new},meta:{}}'
+    else
+        echo "Renamed $old_name → $new_name"
+    fi
+}

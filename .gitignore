@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Local editor / environment
+.env
+.env.*
+.vscode/
+.idea/
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Compiled distributable (built locally by ./compile.sh)
+# Tracked in the repo for Homebrew distribution: do NOT gitignore wp-mcp.sh.
+
+# Local caches from tooling
+.cache/
+.venv/
+
+# Build/package artifacts
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]

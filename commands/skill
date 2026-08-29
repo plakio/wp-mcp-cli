@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# wp-mcp skill install [codex|claude-code|opencode|hermes|pi|global|all]
+
+wpmcp_skill() {
+    local action="${1:-help}"
+    [ "$#" -gt 0 ] && shift
+
+    case "$action" in
+        install)
+            wpmcp_skill_install "$@"
+            ;;
+        help|--help|-h)
+            wpmcp_display_command_help skill
+            ;;
+        *)
+            wpmcp_error_usage "Unknown skill action: $action"
+            ;;
+    esac
+}
+
+wpmcp_skill_install() {
+    local target="${1:-all}"
+
+    # Resolve the path to the bundled SKILL.md.
+    local script_dir=""
+    local source="${BASH_SOURCE[0]:-}"
+    if [ -n "$source" ]; then
+        script_dir="$(cd "$(dirname "$source")/.." && pwd)"
+    fi
+
+    local skill_source=""
+    if [ -n "$script_dir" ] && [ -f "$script_dir/skills/wp-mcp/SKILL.md" ]; then
+        skill_source="$script_dir/skills/wp-mcp/SKILL.md"
+    else
+        # Fallback: download from GitHub.
+        skill_source=$(mktemp)
+        trap 'rm -f "$skill_source"' RETURN
+        curl -fsSL "https://raw.githubusercontent.com/plakio/wp-mcp-cli/main/skills/wp-mcp/SKILL.md" -o "$skill_source" \
+            || wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
+                "Failed to fetch SKILL.md from GitHub."
+    fi
+
+    case "$target" in
+        codex)         wpmcp_skill_install_to "$HOME/.codex/skills/wp-mcp/SKILL.md" "$skill_source" ;;
+        claude-code)   wpmcp_skill_install_to "$HOME/.claude/skills/wp-mcp/SKILL.md" "$skill_source" ;;
+        opencode)      wpmcp_skill_install_to "$HOME/.config/opencode/skills/wp-mcp/SKILL.md" "$skill_source" ;;
+        hermes)        wpmcp_skill_install_to "$HOME/.hermes/skills/wp-mcp/SKILL.md" "$skill_source" ;;
+        pi)            wpmcp_skill_install_to "$HOME/.pi/skills/wp-mcp/SKILL.md" "$skill_source" ;;
+        global)        wpmcp_skill_install_to "$HOME/.agents/skills/wp-mcp/SKILL.md" "$skill_source" ;;
+        all)
+            wpmcp_skill_install_to "$HOME/.codex/skills/wp-mcp/SKILL.md" "$skill_source"
+            wpmcp_skill_install_to "$HOME/.claude/skills/wp-mcp/SKILL.md" "$skill_source"
+            wpmcp_skill_install_to "$HOME/.config/opencode/skills/wp-mcp/SKILL.md" "$skill_source"
+            wpmcp_skill_install_to "$HOME/.hermes/skills/wp-mcp/SKILL.md" "$skill_source"
+            wpmcp_skill_install_to "$HOME/.pi/skills/wp-mcp/SKILL.md" "$skill_source"
+            ;;
+        *)
+            wpmcp_error_usage "Unknown skill target: $target (expected: codex|claude-code|opencode|hermes|pi|global|all)"
+            ;;
+    esac
+}
+
+wpmcp_skill_install_to() {
+    local dest="$1"
+    local source="$2"
+    local dest_dir
+    dest_dir=$(dirname "$dest")
+    mkdir -p "$dest_dir"
+    cp "$source" "$dest"
+    echo "Installed wp-mcp skill to $dest"
+}

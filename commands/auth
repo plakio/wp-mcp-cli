@@ -1,0 +1,184 @@
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# wp-mcp auth login | status | logout
+
+wpmcp_auth() {
+    local action="${1:-help}"
+    [ "$#" -gt 0 ] && shift
+
+    case "$action" in
+        login)
+            wpmcp_auth_login "$@"
+            ;;
+        status)
+            wpmcp_auth_status "$@"
+            ;;
+        logout)
+            wpmcp_auth_logout "$@"
+            ;;
+        help|--help|-h)
+            wpmcp_display_command_help auth
+            ;;
+        *)
+            wpmcp_error_usage "Unknown auth action: $action"
+            ;;
+    esac
+}
+
+wpmcp_auth_login() {
+    wpmcp_paths_ensure
+
+    local url=""
+    local name=""
+    local user=""
+    local pass=""
+
+    # Parse flags after the action.
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --name)
+                name="$2"
+                shift 2
+                ;;
+            --user)
+                user="$2"
+                shift 2
+                ;;
+            --password)
+                pass="$2"
+                shift 2
+                ;;
+            --url)
+                url="$2"
+                shift 2
+                ;;
+            --help|-h)
+                wpmcp_display_command_help auth
+                return 0
+                ;;
+            *)
+                # First non-flag is the URL.
+                if [ -z "$url" ]; then
+                    url="$1"
+                    shift
+                else
+                    wpmcp_error_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -z "$url" ]; then
+        url=$(wpmcp_ui_input "Site URL (e.g. https://dev.localhost)")
+    fi
+    url=$(printf '%s' "$url" | sed 's:/*$::')
+
+    # Derive origin (scheme://host[:port]) and default name.
+    local origin
+    origin=$(printf '%s' "$url" | sed -E 's#^(https?://[^/]+).*#\1#')
+    if [ -z "$name" ]; then
+        name=$(printf '%s' "$origin" | sed -E 's#^https?://##; s#[^a-zA-Z0-9.-]+#-#g; s#^-+##; s#-+$##')
+        if [ -z "$name" ]; then
+            name="default"
+        fi
+    fi
+
+    if [ -z "$user" ]; then
+        user=$(wpmcp_ui_input "WordPress username")
+    fi
+    if [ -z "$pass" ]; then
+        pass=$(wpmcp_ui_password "Application password")
+    fi
+
+    if [ -z "$user" ] || [ -z "$pass" ]; then
+        wpmcp_error_usage "Username and application password are required."
+    fi
+
+    # Quick connectivity check before persisting.
+    WPMCP_ACTIVE_USER="$user"
+    WPMCP_ACTIVE_PASS="$pass"
+    export WPMCP_ACTIVE_USER WPMCP_ACTIVE_PASS
+    WPMCP_ACTIVE_SITE="$name"
+    WPMCP_ACTIVE_ORIGIN="$origin"
+    export WPMCP_ACTIVE_SITE WPMCP_ACTIVE_ORIGIN
+
+    local probe_url="$url/wp-json/wp/v2/users/me"
+    local probe_raw
+    probe_raw=$(wpmcp_http_get "$probe_url")
+    local probe_rc=$?
+    if [ $probe_rc -ne 0 ]; then
+        wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
+            "Failed to reach $probe_url (curl exit $probe_rc)"
+    fi
+    wpmcp_http_split "$probe_raw"
+    if [ "${WPMCP_HTTP_STATUS:-000}" -ge 400 ]; then
+        wpmcp_error_print "auth_denied" "$WPMCP_ERROR_AUTH" \
+            "WordPress rejected the credentials (HTTP $WPMCP_HTTP_STATUS)"
+    fi
+
+    # Persist credentials.
+    wpmcp_auth_save "$name" "$user" "$pass"
+
+    # Upsert the site profile.
+    local profile_json
+    profile_json=$(jq -nc \
+        --arg name "$name" \
+        --arg url "$url" \
+        --arg origin "$origin" \
+        --arg user "$user" \
+        '{name:$name,siteUrl:$url,origin:$origin,defaultUser:$user,createdAt:now|todate}')
+    wpmcp_config_upsert_profile "$name" "$profile_json"
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        jq -nc \
+            --arg name "$name" \
+            --arg url "$url" \
+            --arg origin "$origin" \
+            '{ok:true,data:{name:$name,siteUrl:$url,origin:$origin},meta:{}}'
+    else
+        echo "Logged in to $url as $user. Profile name: $name"
+    fi
+}
+
+wpmcp_auth_status() {
+    if [ -z "${WPMCP_ACTIVE_SITE:-}" ]; then
+        wpmcp_config_resolve_site
+    fi
+
+    local cred_path
+    cred_path=$(wpmcp_auth_cred_path "$WPMCP_ACTIVE_SITE")
+    local profile
+    profile=$(wpmcp_config_get_profile "$WPMCP_ACTIVE_SITE")
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        if [ -f "$cred_path" ]; then
+            jq -nc \
+                --arg site "$WPMCP_ACTIVE_SITE" \
+                --argjson profile "$profile" \
+                '{ok:true,data:{site:$site,profile:$profile,credentialFile:$cred_path},meta:{}}'
+        else
+            jq -nc \
+                --arg site "$WPMCP_ACTIVE_SITE" \
+                '{ok:true,data:{site:$site,credential:false},meta:{}}'
+        fi
+    else
+        echo "Active site: $WPMCP_ACTIVE_SITE"
+        if [ -f "$cred_path" ]; then
+            echo "Credentials: present at $cred_path"
+        else
+            echo "Credentials: missing (run: wp-mcp auth login)"
+        fi
+    fi
+}
+
+wpmcp_auth_logout() {
+    wpmcp_config_resolve_site
+    wpmcp_auth_remove "$WPMCP_ACTIVE_SITE"
+    if [ "$WPMCP_JSON" = "1" ]; then
+        jq -nc --arg site "$WPMCP_ACTIVE_SITE" \
+            '{ok:true,data:{site:$site,removed:true},meta:{}}'
+    else
+        echo "Removed credentials for $WPMCP_ACTIVE_SITE"
+    fi
+}

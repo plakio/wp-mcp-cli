@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# wp-mcp run <ability> --input <json|@file|-> [--yes]
+# Executes an ability via POST /wp-json/wp-mcp/v1/abilities/<ns>/<name>/run
+
+wpmcp_run() {
+    wpmcp_auth_require
+
+    local ability=""
+    local input=""
+    local input_source=""  # "inline" | "file" | "stdin"
+    local input_file=""
+    local yes=0
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --input|-i)
+                input="$2"
+                shift 2
+                ;;
+            --input=*)
+                input="${1#--input=}"
+                shift
+                ;;
+            --yes|-y)
+                yes=1
+                shift
+                ;;
+            --help|-h)
+                wpmcp_display_command_help run
+                return 0
+                ;;
+            *)
+                if [ -z "$ability" ]; then
+                    ability="$1"
+                    shift
+                else
+                    wpmcp_error_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -z "$ability" ]; then
+        wpmcp_error_usage "Usage: wp-mcp run <ability> --input <json|@file|->"
+    fi
+
+    # Parse the input specifier.
+    local input_json="null"
+    if [ -n "$input" ]; then
+        case "$input" in
+            @*)
+                local f="${input#@}"
+                if [ ! -f "$f" ]; then
+                    wpmcp_error_usage "Input file not found: $f"
+                fi
+                input_json=$(cat "$f")
+                ;;
+            -)
+                input_json=$(cat)
+                ;;
+            *)
+                input_json="$input"
+                ;;
+        esac
+    fi
+
+    # Validate JSON before posting.
+    if [ "$input_json" != "null" ] && ! printf '%s' "$input_json" | jq -e . >/dev/null 2>&1; then
+        wpmcp_error_print "usage_error" "$WPMCP_ERROR_USAGE" \
+            "--input is not valid JSON"
+    fi
+
+    # Build the run URL.
+    local segments
+    IFS='/' read -ra segments <<< "$ability"
+    local encoded=""
+    local i
+    for i in "${!segments[@]}"; do
+        local s="${segments[$i]}"
+        if [ $i -gt 0 ]; then encoded="${encoded}/"; fi
+        encoded="${encoded}$(wpmcp_url_path_encode "$s")"
+    done
+    local rest_url
+    rest_url=$(wpmcp_rest_url_for "/wp-mcp/v1/abilities/${encoded}/run")
+
+    # Optional destructive confirmation.
+    if [ "$yes" != "1" ] && [ "$WPMCP_JSON" != "1" ]; then
+        local describe_url
+        describe_url=$(wpmcp_rest_url_for "/wp-abilities/v1/abilities/${encoded}")
+        local describe_raw
+        describe_raw=$(wpmcp_http_get "$describe_url")
+        if [ $? -eq 0 ]; then
+            wpmcp_http_split "$describe_raw"
+            local destructive
+            destructive=$(printf '%s' "$WPMCP_HTTP_BODY" | jq -r '.meta.annotations.destructive // false')
+            if [ "$destructive" = "true" ]; then
+                if ! wpmcp_ui_confirm "Ability '$ability' is marked destructive. Continue?"; then
+                    echo "Cancelled."
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
+    # POST the request.
+    local body
+    body=$(jq -nc --argjson input "$input_json" '{input:$input}')
+
+    local raw
+    raw=$(wpmcp_http_post_json "$rest_url" "$body")
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
+            "Failed to POST $rest_url (curl exit $rc)"
+    fi
+    wpmcp_http_split "$raw"
+    if [ "${WPMCP_HTTP_STATUS:-000}" -ge 400 ]; then
+        wpmcp_http_classify_wp_error "$WPMCP_HTTP_BODY"
+    fi
+
+    local resp_body
+    resp_body=$(printf '%s' "$WPMCP_HTTP_BODY" | jq -c . 2>/dev/null || printf '%s' "$WPMCP_HTTP_BODY")
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        jq -nc \
+            --argjson data "$resp_body" \
+            --arg site "$WPMCP_ACTIVE_SITE" \
+            '{ok:true,data:$data,meta:{site:$site}}'
+    else
+        if echo "$resp_body" | jq -e . >/dev/null 2>&1; then
+            echo "$resp_body" | jq .
+        else
+            printf '%s\n' "$resp_body"
+        fi
+    fi
+}

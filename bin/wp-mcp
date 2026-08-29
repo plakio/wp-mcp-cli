@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+# wp-mcp CLI launcher. Used by Homebrew and curl installs.
+# Resolves to the compiled wp-mcp.sh either next to this file, on PATH,
+# or fetched from the canonical GitHub URL.
+
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]:-}"
+if [ -n "$SOURCE" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+else
+    SCRIPT_DIR=""
+fi
+
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../wp-mcp.sh" ]; then
+    # Running from a checkout; use the compiled script next to us.
+    exec bash "$SCRIPT_DIR/../wp-mcp.sh" "$@"
+fi
+
+if command -v wp-mcp.sh >/dev/null 2>&1; then
+    exec bash "$(command -v wp-mcp.sh)" "$@"
+fi
+
+REMOTE_URL="${WPMCP_INSTALL_URL:-https://raw.githubusercontent.com/plakio/wp-mcp-cli/main/wp-mcp.sh}"
+tmp_script=$(mktemp)
+trap 'rm -f "$tmp_script"' EXIT
+if ! curl -fsSL "$REMOTE_URL" -o "$tmp_script"; then
+    echo "Error: failed to download wp-mcp from $REMOTE_URL" >&2
+    exit 1
+fi
+exec bash "$tmp_script" "$@"

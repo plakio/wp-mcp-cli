@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# wp-mcp describe <ability>
+# Prints the ability record including input_schema, output_schema, and
+# annotations (readonly, destructive, idempotent).
+
+wpmcp_describe() {
+    wpmcp_auth_require
+
+    local ability=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --help|-h) wpmcp_display_command_help describe; return 0 ;;
+            *)
+                if [ -z "$ability" ]; then ability="$1"; shift
+                else wpmcp_error_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -z "$ability" ]; then
+        wpmcp_error_usage "Usage: wp-mcp describe <ability>"
+    fi
+
+    local segments
+    IFS='/' read -ra segments <<< "$ability"
+    local encoded=""
+    local i
+    for i in "${!segments[@]}"; do
+        local s="${segments[$i]}"
+        if [ $i -gt 0 ]; then encoded="${encoded}/"; fi
+        encoded="${encoded}$(wpmcp_url_path_encode "$s")"
+    done
+
+    local rest_url
+    rest_url=$(wpmcp_rest_url_for "/wp-abilities/v1/abilities/${encoded}")
+
+    local raw
+    raw=$(wpmcp_http_get "$rest_url")
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
+            "Failed to fetch $rest_url (curl exit $rc)"
+    fi
+    wpmcp_http_split "$raw"
+    if [ "${WPMCP_HTTP_STATUS:-000}" -ge 400 ]; then
+        wpmcp_http_classify_wp_error "$WPMCP_HTTP_BODY"
+    fi
+
+    local body
+    body=$(printf '%s' "$WPMCP_HTTP_BODY" | jq -c .)
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        jq -nc \
+            --argjson ability "$body" \
+            --arg site "$WPMCP_ACTIVE_SITE" \
+            '{ok:true,data:$ability,meta:{site:$site}}'
+        return 0
+    fi
+
+    if wpmcp_command_exists gum && wpmcp_has_tty; then
+        printf '%s' "$body" | gum pager --border rounded
+    else
+        printf '%s' "$body" | jq .
+    fi
+}
