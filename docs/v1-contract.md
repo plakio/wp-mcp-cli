@@ -66,7 +66,25 @@ wp-mcp [--json] [--quiet] [--site <name>] <command> [args...]
 }
 ```
 
-## Stable error codes
+## Environment variables
+
+| Variable | Effect |
+| -------- | ------ |
+| `WPMCP_HOME` | Override the config/credentials/cache root (default `$HOME/.wp-mcp`). |
+| `WPMCP_SITE` | Same as `--site <name>`; lower priority than the flag. |
+| `WPMCP_USERNAME` | Fallback for `--user` on `auth login`. |
+| `WPMCP_PASSWORD` | Fallback for `--password` on `auth login`. |
+| `WPMCP_REST_PLAIN` | `1` → use `?rest_route=` instead of pretty permalinks. |
+| `WPMCP_HTTP_TIMEOUT` | Per-request curl timeout in seconds (default 30). |
+| `WPMCP_HTTP_VERBOSE` | `1` → pass `--verbose` to curl. |
+| `WPMCP_UPDATE_CHECK` | Reserved for future use. |
+| `WPMCP_CREDENTIAL_BACKEND` | Reserved for future use. |
+
+In non-TTY mode the CLI never auto-prompts. Missing required values
+produce one consolidated `usage_error` exit 2 listing every missing
+input (with the exact flag or env var to set).
+
+
 
 | Code | Exit | Meaning |
 | ---- | ---- | ------- |

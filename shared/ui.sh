@@ -2,15 +2,31 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 # gum wrappers. Every helper checks for a TTY first and falls back to
-# stdin/flags when no TTY is available, so commands remain usable in
-# CI and from coding agents.
+# stdin/flags/env when no TTY is available, so commands remain usable
+# in CI and from coding agents.
+#
+# The second positional argument is the "flag hint" — a short string
+# (e.g. "--user", "WPMCP_USERNAME") that the error message includes so
+# the caller knows exactly which mechanism to use in non-TTY mode.
 
 wpmcp_ui_input() {
-    # wpmcp_ui_input <prompt> [<default>] → echoes value
+    # wpmcp_ui_input <prompt> <flag_hint> [<default>] [env_var]
+    #   flag_hint: short hint like "--user" or "WPMCP_USERNAME" shown
+    #              in the non-TTY error.
+    #   env_var:   optional environment variable to read as a fallback
+    #              before falling back to gum.
     local prompt="$1"
-    local default="${2:-}"
+    local flag_hint="$2"
+    local default="${3:-}"
+    local env_var="${4:-}"
+
+    if [ -n "$env_var" ] && [ -n "${!env_var:-}" ]; then
+        printf '%s' "${!env_var}"
+        return 0
+    fi
+
     if ! wpmcp_has_tty; then
-        wpmcp_error_usage "$prompt (no TTY available; pass the value via flag)"
+        wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag${env_var:+ or set $env_var}."
     fi
     wpmcp_require_gum
     local args=(--prompt "$prompt" --prompt.foreground 212)
@@ -21,17 +37,25 @@ wpmcp_ui_input() {
 }
 
 wpmcp_ui_password() {
-    # wpmcp_ui_password <prompt> → echoes value
+    # wpmcp_ui_password <prompt> <flag_hint> [env_var]
     local prompt="$1"
+    local flag_hint="$2"
+    local env_var="${3:-}"
+
+    if [ -n "$env_var" ] && [ -n "${!env_var:-}" ]; then
+        printf '%s' "${!env_var}"
+        return 0
+    fi
+
     if ! wpmcp_has_tty; then
-        wpmcp_error_usage "$prompt (no TTY available; pass the value via flag)"
+        wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag${env_var:+ or set $env_var}."
     fi
     wpmcp_require_gum
     gum input --password --prompt "$prompt" --prompt.foreground 212
 }
 
 wpmcp_ui_confirm() {
-    # wpmcp_ui_confirm <prompt> [<default_yes>] → echoes "Yes" or "No"
+    # wpmcp_ui_confirm <prompt> [<default_yes>]
     local prompt="$1"
     local default_yes="${2:-true}"
     if ! wpmcp_has_tty; then
@@ -49,11 +73,12 @@ wpmcp_ui_confirm() {
 }
 
 wpmcp_ui_choose() {
-    # wpmcp_ui_choose <prompt> <newline_separated_options> → echoes selected
+    # wpmcp_ui_choose <prompt> <flag_hint> <newline_separated_options>
     local prompt="$1"
-    shift
+    local flag_hint="$2"
+    shift 2
     if ! wpmcp_has_tty; then
-        wpmcp_error_usage "$prompt (no TTY available; pass the value via flag)"
+        wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag."
     fi
     wpmcp_require_gum
     printf '%s\n' "$@" | gum choose --prompt "$prompt" --header "$prompt"

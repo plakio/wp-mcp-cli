@@ -829,15 +829,31 @@ wpmcp_paths_ensure() {
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 # gum wrappers. Every helper checks for a TTY first and falls back to
-# stdin/flags when no TTY is available, so commands remain usable in
-# CI and from coding agents.
+# stdin/flags/env when no TTY is available, so commands remain usable
+# in CI and from coding agents.
+#
+# The second positional argument is the "flag hint" — a short string
+# (e.g. "--user", "WPMCP_USERNAME") that the error message includes so
+# the caller knows exactly which mechanism to use in non-TTY mode.
 
 wpmcp_ui_input() {
-    # wpmcp_ui_input <prompt> [<default>] → echoes value
+    # wpmcp_ui_input <prompt> <flag_hint> [<default>] [env_var]
+    #   flag_hint: short hint like "--user" or "WPMCP_USERNAME" shown
+    #              in the non-TTY error.
+    #   env_var:   optional environment variable to read as a fallback
+    #              before falling back to gum.
     local prompt="$1"
-    local default="${2:-}"
+    local flag_hint="$2"
+    local default="${3:-}"
+    local env_var="${4:-}"
+
+    if [ -n "$env_var" ] && [ -n "${!env_var:-}" ]; then
+        printf '%s' "${!env_var}"
+        return 0
+    fi
+
     if ! wpmcp_has_tty; then
-        wpmcp_error_usage "$prompt (no TTY available; pass the value via flag)"
+        wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag${env_var:+ or set $env_var}."
     fi
     wpmcp_require_gum
     local args=(--prompt "$prompt" --prompt.foreground 212)
@@ -848,17 +864,25 @@ wpmcp_ui_input() {
 }
 
 wpmcp_ui_password() {
-    # wpmcp_ui_password <prompt> → echoes value
+    # wpmcp_ui_password <prompt> <flag_hint> [env_var]
     local prompt="$1"
+    local flag_hint="$2"
+    local env_var="${3:-}"
+
+    if [ -n "$env_var" ] && [ -n "${!env_var:-}" ]; then
+        printf '%s' "${!env_var}"
+        return 0
+    fi
+
     if ! wpmcp_has_tty; then
-        wpmcp_error_usage "$prompt (no TTY available; pass the value via flag)"
+        wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag${env_var:+ or set $env_var}."
     fi
     wpmcp_require_gum
     gum input --password --prompt "$prompt" --prompt.foreground 212
 }
 
 wpmcp_ui_confirm() {
-    # wpmcp_ui_confirm <prompt> [<default_yes>] → echoes "Yes" or "No"
+    # wpmcp_ui_confirm <prompt> [<default_yes>]
     local prompt="$1"
     local default_yes="${2:-true}"
     if ! wpmcp_has_tty; then
@@ -876,11 +900,12 @@ wpmcp_ui_confirm() {
 }
 
 wpmcp_ui_choose() {
-    # wpmcp_ui_choose <prompt> <newline_separated_options> → echoes selected
+    # wpmcp_ui_choose <prompt> <flag_hint> <newline_separated_options>
     local prompt="$1"
-    shift
+    local flag_hint="$2"
+    shift 2
     if ! wpmcp_has_tty; then
-        wpmcp_error_usage "$prompt (no TTY available; pass the value via flag)"
+        wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag."
     fi
     wpmcp_require_gum
     printf '%s\n' "$@" | gum choose --prompt "$prompt" --header "$prompt"
@@ -1047,9 +1072,44 @@ wpmcp_auth_login() {
         esac
     done
 
-    if [ -z "$url" ]; then
-        url=$(wpmcp_ui_input "Site URL (e.g. https://dev.localhost)")
+    # Pre-resolve everything we can from flags + env, then collect the
+    # list of values that still need to come from gum (interactive) or
+    # the user (a clearer error in non-TTY mode). This collapses the
+    # error path to a single message listing every missing input.
+
+    if [ -z "$user" ] && [ -n "${WPMCP_USERNAME:-}" ]; then
+        user="$WPMCP_USERNAME"
     fi
+    if [ -z "$pass" ] && [ -n "${WPMCP_PASSWORD:-}" ]; then
+        pass="$WPMCP_PASSWORD"
+    fi
+
+    local missing=()
+    [ -z "$url" ]  && missing+=("site URL (positional argument or --url)")
+    [ -z "$user" ] && missing+=("WordPress username (--user or WPMCP_USERNAME)")
+    [ -z "$pass" ] && missing+=("application password (--password or WPMCP_PASSWORD)")
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        if ! wpmcp_has_tty; then
+            printf 'Error: missing required values for auth login:\n' >&2
+            for m in "${missing[@]}"; do
+                printf '  - %s\n' "$m" >&2
+            done
+            exit "$WPMCP_ERROR_USAGE"
+        fi
+
+        # Interactive fallback: prompt for whatever is still missing.
+        if [ -z "$url" ]; then
+            url=$(wpmcp_ui_input "Site URL (e.g. https://dev.localhost)" "url")
+        fi
+        if [ -z "$user" ]; then
+            user=$(wpmcp_ui_input "WordPress username" "--user")
+        fi
+        if [ -z "$pass" ]; then
+            pass=$(wpmcp_ui_password "Application password" "--password")
+        fi
+    fi
+
     url=$(printf '%s' "$url" | sed 's:/*$::')
 
     # Derive origin (scheme://host[:port]) and default name.
@@ -1060,17 +1120,6 @@ wpmcp_auth_login() {
         if [ -z "$name" ]; then
             name="default"
         fi
-    fi
-
-    if [ -z "$user" ]; then
-        user=$(wpmcp_ui_input "WordPress username")
-    fi
-    if [ -z "$pass" ]; then
-        pass=$(wpmcp_ui_password "Application password")
-    fi
-
-    if [ -z "$user" ] || [ -z "$pass" ]; then
-        wpmcp_error_usage "Username and application password are required."
     fi
 
     # Quick connectivity check before persisting.

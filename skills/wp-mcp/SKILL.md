@@ -128,6 +128,26 @@ The `--input` flag accepts:
 `~/.wp-mcp/credentials/<site>.json` with `chmod 0600`. The CLI never
 prints the password back. To rotate, `wp-mcp auth logout && wp-mcp auth login`.
 
+**Non-interactive flags** (for CI/scripts/agents with no TTY):
+
+```bash
+wp-mcp auth login <url> --name <profile> --user <user> --password '<app-password>'
+```
+
+**Environment variable fallback** (same flags, no hardcoding on the command line):
+
+- `WPMCP_USERNAME` — read when `--user` is absent
+- `WPMCP_PASSWORD` — read when `--password` is absent
+
+In non-TTY mode the CLI fails fast with a single error listing every
+missing value (no N sequential prompts), e.g.:
+
+```
+Error: missing required values for auth login:
+  - WordPress username (--user or WPMCP_USERNAME)
+  - application password (--password or WPMCP_PASSWORD)
+```
+
 ## Troubleshooting
 
 - `wp-mcp: command not found` — re-run the installer and check `$PATH`.
