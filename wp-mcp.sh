@@ -119,8 +119,9 @@ Usage:
   wp-mcp auth <action> [args]
 
 Actions:
-  login [<url>] [--name <name>]    Save credentials for a WP-MCP site
-  status                            Show the active profile and credential summary
+  login [<url>] [--name <name>]    Save (or rotate) credentials for a WP-MCP site
+  status                            Show credential summary for every saved profile
+                                   (or just the active one with --site <name>)
   logout                            Remove credentials for the active site
   help                              Show this help
 
@@ -1169,34 +1170,74 @@ wpmcp_auth_login() {
 }
 
 wpmcp_auth_status() {
-    if [ -z "${WPMCP_ACTIVE_SITE:-}" ]; then
-        wpmcp_config_resolve_site
-    fi
+    # No site selection is required. Status is informative even when
+    # multiple profiles exist; we report on every saved profile by
+    # default, and narrow to --site <name> / WPMCP_SITE if requested.
 
-    local cred_path
-    cred_path=$(wpmcp_auth_cred_path "$WPMCP_ACTIVE_SITE")
-    local profile
-    profile=$(wpmcp_config_get_profile "$WPMCP_ACTIVE_SITE")
+    wpmcp_paths_init
+    local config
+    config=$(wpmcp_config_load)
 
-    if [ "$WPMCP_JSON" = "1" ]; then
-        if [ -f "$cred_path" ]; then
-            jq -nc \
-                --arg site "$WPMCP_ACTIVE_SITE" \
-                --argjson profile "$profile" \
-                '{ok:true,data:{site:$site,profile:$profile,credentialFile:$cred_path},meta:{}}'
-        else
-            jq -nc \
-                --arg site "$WPMCP_ACTIVE_SITE" \
-                '{ok:true,data:{site:$site,credential:false},meta:{}}'
+    # WPMCP_SITE comes from --site <name> / WPMCP_SITE env (set by main).
+    # WPMCP_ACTIVE_SITE comes from a previous wpmcp_config_resolve_site
+    # call. Either is fine; --site takes priority.
+    local target="${WPMCP_SITE:-${WPMCP_ACTIVE_SITE:-}}"
+    local entries
+    if [ -n "$target" ]; then
+        entries=$(echo "$config" | jq -c --arg n "$target" '
+            if .profiles[$n] then [{site:$n, profile:.profiles[$n]}]
+            else [] end')
+        if [ "$entries" = "[]" ]; then
+            wpmcp_error_site_not_found "$target" "$(echo "$config" | jq -c '[.profiles | keys[]]')"
         fi
     else
-        echo "Active site: $WPMCP_ACTIVE_SITE"
-        if [ -f "$cred_path" ]; then
-            echo "Credentials: present at $cred_path"
-        else
-            echo "Credentials: missing (run: wp-mcp auth login)"
-        fi
+        entries=$(echo "$config" | jq -c '[.profiles | to_entries[] | {site:.key, profile:.value}]')
     fi
+
+    # Annotate each entry with credential presence and metadata.
+    entries=$(echo "$entries" | jq -c '
+        map(. + {
+            credentialFile: ("'$WPMCP_CREDS_DIR'/" + .site + ".json"),
+            credential: false,
+            credentialCreatedAt: null
+        } | if .credentialFile | startswith("/") then . else . end)')
+
+    local annotated="[]"
+    local site cred_path has_cred
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        site=$(echo "$entry" | jq -r '.site')
+        cred_path="$WPMCP_CREDS_DIR/$site.json"
+        if [ -f "$cred_path" ]; then
+            has_cred=true
+            annotated=$(echo "$annotated" | jq -c \
+                --argjson e "$entry" \
+                '. + [$e + {credential:true, credentialCreatedAt:(($e.profile.createdAt) // null)}]')
+        else
+            has_cred=false
+            annotated=$(echo "$annotated" | jq -c --argjson e "$entry" '. + [$e + {credential:false}]')
+        fi
+    done < <(echo "$entries" | jq -c '.[]')
+
+    if [ "$WPMCP_JSON" = "1" ]; then
+        jq -nc --argjson data "$annotated" '{ok:true,data:$data,meta:{}}'
+        return 0
+    fi
+
+    echo "wp-mcp auth status"
+    echo "================="
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        local s u cred_str
+        s=$(echo "$entry" | jq -r '.site')
+        u=$(echo "$entry" | jq -r '.profile.defaultUser // "-"')
+        if [ "$(echo "$entry" | jq -r '.credential')" = "true" ]; then
+            cred_str="present"
+        else
+            cred_str="missing"
+        fi
+        printf "  %-15s user=%-12s credentials=%s\n" "$s" "$u" "$cred_str"
+    done < <(echo "$annotated" | jq -c '.[]')
 }
 
 wpmcp_auth_logout() {

@@ -119,8 +119,9 @@ Usage:
   wp-mcp auth <action> [args]
 
 Actions:
-  login [<url>] [--name <name>]    Save credentials for a WP-MCP site
-  status                            Show the active profile and credential summary
+  login [<url>] [--name <name>]    Save (or rotate) credentials for a WP-MCP site
+  status                            Show credential summary for every saved profile
+                                   (or just the active one with --site <name>)
   logout                            Remove credentials for the active site
   help                              Show this help
 
