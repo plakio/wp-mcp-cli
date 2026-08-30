@@ -77,7 +77,7 @@ wpmcp_config_resolve_site() {
     if [ -n "$explicit" ]; then
         local exists
         exists=$(echo "$config" | jq -r --arg n "$explicit" '(.profiles[$n] // null) | type')
-        if [ "$exists" != '"object"' ]; then
+        if [ "$exists" != "object" ]; then
             local known
             known=$(echo "$config" | jq -c '[.profiles | keys[]]')
             wpmcp_error_site_not_found "$explicit" "$known"

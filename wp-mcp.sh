@@ -471,7 +471,7 @@ wpmcp_config_resolve_site() {
     if [ -n "$explicit" ]; then
         local exists
         exists=$(echo "$config" | jq -r --arg n "$explicit" '(.profiles[$n] // null) | type')
-        if [ "$exists" != '"object"' ]; then
+        if [ "$exists" != "object" ]; then
             local known
             known=$(echo "$config" | jq -c '[.profiles | keys[]]')
             wpmcp_error_site_not_found "$explicit" "$known"
@@ -1649,7 +1649,7 @@ wpmcp_sites_remove() {
 
     local exists
     exists=$(wpmcp_config_load | jq -r --arg n "$name" '(.profiles[$n] // null) | type')
-    if [ "$exists" != '"object"' ]; then
+    if [ "$exists" != "object" ]; then
         wpmcp_error_usage "Site profile '$name' not found."
     fi
 
@@ -1692,7 +1692,7 @@ wpmcp_sites_rename() {
     config=$(wpmcp_config_load)
     local exists
     exists=$(echo "$config" | jq -r --arg n "$old_name" '(.profiles[$n] // null) | type')
-    if [ "$exists" != '"object"' ]; then
+    if [ "$exists" != "object" ]; then
         wpmcp_error_usage "Site profile '$old_name' not found."
     fi
 
