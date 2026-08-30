@@ -43,15 +43,19 @@ wpmcp_sites_list() {
     fi
 
     if wpmcp_has_tty; then
-        # Use ANSI-C $'...' so \t and \n become real tab/newline
-        # characters. Plain "..." would pass literal backslash-t to gum.
-        local tsv=$'Name\tURL\tUser'
+        # gum's --columns provides the column headers; the data on
+        # stdin must contain ONLY data rows, not a header line.
+        local tsv=""
         while IFS= read -r n; do
             [ -z "$n" ] && continue
             local url user
             url=$(echo "$config" | jq -r --arg n "$n" '.profiles[$n].siteUrl // ""')
             user=$(echo "$config" | jq -r --arg n "$n" '.profiles[$n].defaultUser // ""')
-            tsv+=$'\n'"${n}"$'\t'"${url}"$'\t'"${user}"
+            if [ -z "$tsv" ]; then
+                tsv+="${n}"$'\t'"${url}"$'\t'"${user}"
+            else
+                tsv+=$'\n'"${n}"$'\t'"${url}"$'\t'"${user}"
+            fi
         done <<< "$names"
         wpmcp_ui_table "$tsv" "Name,URL,User"
     else

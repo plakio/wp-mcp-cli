@@ -54,13 +54,10 @@ wpmcp_discover() {
     fi
 
     if wpmcp_has_tty; then
-        local tsv=$'Name\tLabel\tCategory\tReadonly\tDestructive'
         local labels
         labels=$(printf '%s' "$all_abilities" | jq -r '.[] | [.name, (.label // ""), (.category // ""), (.meta.annotations.readonly // false|tostring), (.meta.annotations.destructive // false|tostring)] | @tsv')
-        if [ -n "$labels" ]; then
-            tsv+=$'\n'"${labels}"
-        fi
-        wpmcp_ui_table "$tsv" "Name,Label,Category,Readonly,Destructive"
+        # gum's --columns supplies the header; stdin contains ONLY rows.
+        wpmcp_ui_table "$labels" "Name,Label,Category,Readonly,Destructive"
     else
         printf '%s' "$all_abilities" | jq -r '.[] | "\(.name)\t\(.label // "")\t\(.category // "")"'
     fi

@@ -1379,13 +1379,10 @@ wpmcp_discover() {
     fi
 
     if wpmcp_has_tty; then
-        local tsv=$'Name\tLabel\tCategory\tReadonly\tDestructive'
         local labels
         labels=$(printf '%s' "$all_abilities" | jq -r '.[] | [.name, (.label // ""), (.category // ""), (.meta.annotations.readonly // false|tostring), (.meta.annotations.destructive // false|tostring)] | @tsv')
-        if [ -n "$labels" ]; then
-            tsv+=$'\n'"${labels}"
-        fi
-        wpmcp_ui_table "$tsv" "Name,Label,Category,Readonly,Destructive"
+        # gum's --columns supplies the header; stdin contains ONLY rows.
+        wpmcp_ui_table "$labels" "Name,Label,Category,Readonly,Destructive"
     else
         printf '%s' "$all_abilities" | jq -r '.[] | "\(.name)\t\(.label // "")\t\(.category // "")"'
     fi
@@ -1697,15 +1694,19 @@ wpmcp_sites_list() {
     fi
 
     if wpmcp_has_tty; then
-        # Use ANSI-C $'...' so \t and \n become real tab/newline
-        # characters. Plain "..." would pass literal backslash-t to gum.
-        local tsv=$'Name\tURL\tUser'
+        # gum's --columns provides the column headers; the data on
+        # stdin must contain ONLY data rows, not a header line.
+        local tsv=""
         while IFS= read -r n; do
             [ -z "$n" ] && continue
             local url user
             url=$(echo "$config" | jq -r --arg n "$n" '.profiles[$n].siteUrl // ""')
             user=$(echo "$config" | jq -r --arg n "$n" '.profiles[$n].defaultUser // ""')
-            tsv+=$'\n'"${n}"$'\t'"${url}"$'\t'"${user}"
+            if [ -z "$tsv" ]; then
+                tsv+="${n}"$'\t'"${url}"$'\t'"${user}"
+            else
+                tsv+=$'\n'"${n}"$'\t'"${url}"$'\t'"${user}"
+            fi
         done <<< "$names"
         wpmcp_ui_table "$tsv" "Name,URL,User"
     else
