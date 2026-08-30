@@ -923,9 +923,10 @@ wpmcp_ui_table() {
     fi
     wpmcp_require_gum
     local args=()
+    # gum's --columns flag expects a single comma-separated string,
+    # not one argv entry per column name.
     if [ -n "$columns" ]; then
-        IFS=',' read -ra cols <<< "$columns"
-        args+=(--columns "${cols[@]}")
+        args+=(--columns "$columns")
     fi
     printf '%s\n' "$tsv" | gum table "${args[@]}" --border rounded --print
 }
