@@ -928,7 +928,12 @@ wpmcp_ui_table() {
     if [ -n "$columns" ]; then
         args+=(--columns "$columns")
     fi
-    printf '%s\n' "$tsv" | gum table "${args[@]}" --border rounded --print
+    # gum's --separator flag sets the field separator. The flag is
+    # documented with a comma as its example value, which makes it
+    # ambiguous whether the default is comma or auto-detected tab.
+    # Pass tab explicitly so the field split is unambiguous and works
+    # the same on every gum version.
+    printf '%s\n' "$tsv" | gum table "${args[@]}" --separator $'\t' --border rounded --print
 }
 
 wpmcp_ui_spin() {
