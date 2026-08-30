@@ -9,7 +9,7 @@
 set -euo pipefail
 
 WPMCP_NAME="wp-mcp"
-WPMCP_VERSION="0.1.3"
+WPMCP_VERSION="0.1.4"
 WPMCP_HOME="${WPMCP_HOME:-$HOME/.wp-mcp}"
 
 # Ensure common user-managed binary locations are available when launched
