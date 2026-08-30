@@ -1800,15 +1800,18 @@ wpmcp_skill_install() {
     fi
 
     local skill_source=""
+    local skill_source_is_temp=0
     if [ -n "$script_dir" ] && [ -f "$script_dir/skills/wp-mcp/SKILL.md" ]; then
         skill_source="$script_dir/skills/wp-mcp/SKILL.md"
     else
         # Fallback: download from GitHub.
         skill_source=$(mktemp)
-        trap 'rm -f "$skill_source"' RETURN
-        curl -fsSL "https://raw.githubusercontent.com/plakio/wp-mcp-cli/main/skills/wp-mcp/SKILL.md" -o "$skill_source" \
-            || wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
+        skill_source_is_temp=1
+        if ! curl -fsSL "https://raw.githubusercontent.com/plakio/wp-mcp-cli/main/skills/wp-mcp/SKILL.md" -o "$skill_source"; then
+            rm -f "$skill_source"
+            wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
                 "Failed to fetch SKILL.md from GitHub."
+        fi
     fi
 
     case "$target" in
@@ -1829,6 +1832,12 @@ wpmcp_skill_install() {
             wpmcp_error_usage "Unknown skill target: $target (expected: codex|claude-code|opencode|hermes|pi|global|all)"
             ;;
     esac
+
+    # Clean up the temp file if we created one. Avoids a RETURN trap so
+    # `set -u` does not flag the unset local at function exit.
+    if [ "$skill_source_is_temp" = "1" ]; then
+        rm -f "$skill_source"
+    fi
 }
 
 wpmcp_skill_install_to() {
