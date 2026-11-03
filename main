@@ -247,6 +247,10 @@ Usage:
 Installs the wp-mcp agent skill to the requested agent's skills directory.
 "all" installs agent-specific targets only (codex, claude-code, opencode,
 hermes, pi). Use "global" to install into ~/.agents/skills/ explicitly.
+
+The skill comes from the local checkout when the CLI runs from one; otherwise
+it is downloaded from the v<VERSION> tag, never from main, so it always
+matches this binary.
 HELP
             ;;
         version)

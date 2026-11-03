@@ -60,3 +60,6 @@ jobs:
 
       - name: Run code-mode tests
         run: ./tests/code.sh
+
+      - name: Run skill installer tests
+        run: ./tests/skill.sh

@@ -247,6 +247,10 @@ Usage:
 Installs the wp-mcp agent skill to the requested agent's skills directory.
 "all" installs agent-specific targets only (codex, claude-code, opencode,
 hermes, pi). Use "global" to install into ~/.agents/skills/ explicitly.
+
+The skill comes from the local checkout when the CLI runs from one; otherwise
+it is downloaded from the v<VERSION> tag, never from main, so it always
+matches this binary.
 HELP
             ;;
         version)
@@ -3883,49 +3887,68 @@ wpmcp_skill() {
     esac
 }
 
+# The skill documents the flags and contract of one specific CLI version, so a
+# released binary must install the SKILL.md from its own tag. Falling back to
+# main would pair an old binary with a newer skill.
+wpmcp_skill_source_url() {
+    printf 'https://raw.githubusercontent.com/plakio/wp-mcp-cli/v%s/skills/wp-mcp/SKILL.md' "$WPMCP_VERSION"
+}
+
+# A checkout carries the skill that matches the code being edited, including
+# unreleased versions and local changes.
+wpmcp_skill_local_source() {
+    local source="${BASH_SOURCE[0]:-}"
+    [ -n "$source" ] || return 1
+    local dir
+    dir=$(cd "$(dirname "$source")" 2>/dev/null && pwd) || return 1
+    local candidate="$dir/skills/wp-mcp/SKILL.md"
+    [ -f "$candidate" ] || return 1
+    printf '%s' "$candidate"
+}
+
 wpmcp_skill_install() {
     local target="${1:-all}"
-
-    # Resolve the path to the bundled SKILL.md.
-    local script_dir=""
-    local source="${BASH_SOURCE[0]:-}"
-    if [ -n "$source" ]; then
-        script_dir="$(cd "$(dirname "$source")/.." && pwd)"
-    fi
-
-    local skill_source=""
-    local skill_source_is_temp=0
-    if [ -n "$script_dir" ] && [ -f "$script_dir/skills/wp-mcp/SKILL.md" ]; then
-        skill_source="$script_dir/skills/wp-mcp/SKILL.md"
-    else
-        # Fallback: download from GitHub.
-        skill_source=$(mktemp)
-        skill_source_is_temp=1
-        if ! curl -fsSL "https://raw.githubusercontent.com/plakio/wp-mcp-cli/main/skills/wp-mcp/SKILL.md" -o "$skill_source"; then
-            rm -f "$skill_source"
-            wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
-                "Failed to fetch SKILL.md from GitHub."
-        fi
-    fi
+    local -a destinations=()
 
     case "$target" in
-        codex)         wpmcp_skill_install_to "$HOME/.codex/skills/wp-mcp/SKILL.md" "$skill_source" ;;
-        claude-code)   wpmcp_skill_install_to "$HOME/.claude/skills/wp-mcp/SKILL.md" "$skill_source" ;;
-        opencode)      wpmcp_skill_install_to "$HOME/.config/opencode/skills/wp-mcp/SKILL.md" "$skill_source" ;;
-        hermes)        wpmcp_skill_install_to "$HOME/.hermes/skills/wp-mcp/SKILL.md" "$skill_source" ;;
-        pi)            wpmcp_skill_install_to "$HOME/.pi/skills/wp-mcp/SKILL.md" "$skill_source" ;;
-        global)        wpmcp_skill_install_to "$HOME/.agents/skills/wp-mcp/SKILL.md" "$skill_source" ;;
+        codex)       destinations=("$HOME/.codex/skills/wp-mcp/SKILL.md") ;;
+        claude-code) destinations=("$HOME/.claude/skills/wp-mcp/SKILL.md") ;;
+        opencode)    destinations=("$HOME/.config/opencode/skills/wp-mcp/SKILL.md") ;;
+        hermes)      destinations=("$HOME/.hermes/skills/wp-mcp/SKILL.md") ;;
+        pi)          destinations=("$HOME/.pi/skills/wp-mcp/SKILL.md") ;;
+        global)      destinations=("$HOME/.agents/skills/wp-mcp/SKILL.md") ;;
         all)
-            wpmcp_skill_install_to "$HOME/.codex/skills/wp-mcp/SKILL.md" "$skill_source"
-            wpmcp_skill_install_to "$HOME/.claude/skills/wp-mcp/SKILL.md" "$skill_source"
-            wpmcp_skill_install_to "$HOME/.config/opencode/skills/wp-mcp/SKILL.md" "$skill_source"
-            wpmcp_skill_install_to "$HOME/.hermes/skills/wp-mcp/SKILL.md" "$skill_source"
-            wpmcp_skill_install_to "$HOME/.pi/skills/wp-mcp/SKILL.md" "$skill_source"
+            destinations=(
+                "$HOME/.codex/skills/wp-mcp/SKILL.md"
+                "$HOME/.claude/skills/wp-mcp/SKILL.md"
+                "$HOME/.config/opencode/skills/wp-mcp/SKILL.md"
+                "$HOME/.hermes/skills/wp-mcp/SKILL.md"
+                "$HOME/.pi/skills/wp-mcp/SKILL.md"
+            )
             ;;
         *)
             wpmcp_error_usage "Unknown skill target: $target (expected: codex|claude-code|opencode|hermes|pi|global|all)"
             ;;
     esac
+
+    local skill_source=""
+    local skill_source_is_temp=0
+    if ! skill_source=$(wpmcp_skill_local_source); then
+        skill_source=$(mktemp)
+        skill_source_is_temp=1
+        local url
+        url=$(wpmcp_skill_source_url)
+        if ! curl -fsSL --max-time 30 "$url" -o "$skill_source" || [ ! -s "$skill_source" ]; then
+            rm -f "$skill_source"
+            wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
+                "Could not fetch the skill for v$WPMCP_VERSION: $url"
+        fi
+    fi
+
+    local dest
+    for dest in "${destinations[@]}"; do
+        wpmcp_skill_install_to "$dest" "$skill_source"
+    done
 
     # Clean up the temp file if we created one. Avoids a RETURN trap so
     # `set -u` does not flag the unset local at function exit.
