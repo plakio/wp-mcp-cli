@@ -149,9 +149,10 @@ Steps:
   1. Update WPMCP_VERSION in main
   2. Compile wp-mcp.sh
   3. Validate bash syntax
-  4. Commit + push
-  5. Tag v$TARGET_VERSION + push
-  6. Create GitHub Release$( [ "$SKIP_RELEASE" = "1" ] && echo " (skipped by --skip-release)" || true )
+  4. Run no-site tests (hardening + code mode)
+  5. Commit + push
+  6. Tag v$TARGET_VERSION + push
+  7. Create GitHub Release$( [ "$SKIP_RELEASE" = "1" ] && echo " (skipped by --skip-release)" || true )
 
 Release notes:
 $notes
@@ -177,8 +178,11 @@ rm -f main.bak
 # 2. Compile.
 ./compile.sh
 
-# 3. Validate syntax.
-bash -n main shared/* commands/* compile.sh install.sh wp-mcp.sh
+# 3. Validate syntax and run the no-site test suites. These use a fake CLI and
+# fake curl/jq; they do not require a WordPress site or WPMCP_TEST_* variables.
+bash -n main shared/* commands/* compile.sh install.sh tests/*.sh wp-mcp.sh
+./tests/hardening.sh
+./tests/code.sh
 
 # 4. Commit + push.
 git add main wp-mcp.sh

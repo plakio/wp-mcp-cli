@@ -49,11 +49,16 @@ The script:
 2. Updates `WPMCP_VERSION` in `main`.
 3. Compiles the Bash distributable (`wp-mcp.sh`) via `compile.sh`.
 4. Validates shell syntax with `bash -n`.
-5. Commits the version bump and pushes `main`.
-6. Creates and pushes tag `v<version>`.
-7. Creates a GitHub Release with the notes via `gh`, unless `--skip-release`
+5. Runs the no-site test suites: `tests/hardening.sh` and `tests/code.sh`.
+6. Commits the version bump and pushes `main`.
+7. Creates and pushes tag `v<version>`.
+8. Creates a GitHub Release with the notes via `gh`, unless `--skip-release`
    is passed. If `gh` is missing or not authenticated, the tag is still
    pushed and the script prints a warning.
+
+The release gate does **not** use a WordPress site. The no-site suites run
+against a fake CLI and fake `curl`/`jq`. `tests/smoke.sh` is an optional
+manual check and is not run by `scripts/release.sh`.
 
 For curated notes, start with the release's highlights, requirements, and
 validation. The script appends a **Full Changelog** link automatically when

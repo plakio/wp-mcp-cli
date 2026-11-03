@@ -180,8 +180,9 @@ bash -n main shared/*.sh commands/*
 ./tests/smoke.sh       # requires WPMCP_TEST_URL/USER/PASSWORD
 ```
 
-CI runs the no-site tests on push and pull requests. The live smoke test is
-manual and requires a disposable WordPress site.
+CI and `scripts/release.sh` run the no-site tests. The live smoke test is
+optional and requires a disposable WordPress site; it is not part of the
+release gate.
 
 ## License
 
