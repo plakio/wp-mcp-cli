@@ -16,10 +16,10 @@ concurrency:
 jobs:
   no-site:
     name: No-site tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
