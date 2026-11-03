@@ -210,7 +210,9 @@ When editing wp-mcp-cli:
 3. Validate: `bash -n main shared/* commands/* compile.sh install.sh wp-mcp.sh`.
 4. Run the no-site tests: `./tests/hardening.sh` and `./tests/code.sh`.
 5. Smoke test against a real site: `./tests/smoke.sh` (when present).
-6. Releases use `scripts/release.sh [version]`; it bumps the version,
+6. CI runs `tests/hardening.sh` and `tests/code.sh` on push and pull
+   requests; the live smoke test is manual.
+7. Releases use `scripts/release.sh [version]`; it bumps the version,
    compiles, commits, pushes the tag, and creates a GitHub Release. Use
    `--dry-run` to preview and `--notes-file <path>` for curated notes. The tag
    also notifies the Homebrew tap via `.github/workflows/notify-homebrew-tap.yml`.

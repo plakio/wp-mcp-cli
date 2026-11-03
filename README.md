@@ -1,5 +1,7 @@
 # wp-mcp-cli
 
+[![Tests](https://github.com/plakio/wp-mcp-cli/actions/workflows/test.yml/badge.svg)](https://github.com/plakio/wp-mcp-cli/actions/workflows/test.yml)
+
 `wp-mcp-cli` is a Bash + [`gum`](https://github.com/charmbracelet/gum) CLI for the [WP-MCP WordPress plugin](https://github.com/plakio/wp-mcp). It talks to the plugin over WordPress Application Passwords (HTTP Basic) and exposes the same `WP_Ability` registry that the MCP server uses — without going through JSON-RPC.
 
 The CLI is designed for **local Plak sites**. It does not handle OAuth, device flow, multi-host production, or Windows-native installs.
@@ -177,6 +179,9 @@ bash -n main shared/*.sh commands/*
 ./tests/code.sh        # no site required
 ./tests/smoke.sh       # requires WPMCP_TEST_URL/USER/PASSWORD
 ```
+
+CI runs the no-site tests on push and pull requests. The live smoke test is
+manual and requires a disposable WordPress site.
 
 ## License
 

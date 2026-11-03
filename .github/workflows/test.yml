@@ -1,0 +1,52 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  no-site:
+    name: No-site tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Check PHP runtime
+        run: |
+          php -r 'echo PHP_VERSION, PHP_EOL; exit((PHP_VERSION_ID >= 80000 && function_exists("proc_open")) ? 0 : 1);'
+
+      - name: Compile
+        run: ./compile.sh
+
+      - name: Check compiled artifact
+        run: git diff --exit-code -- wp-mcp.sh
+
+      - name: Validate shell syntax
+        run: bash -n main shared/* commands/* compile.sh install.sh tests/*.sh
+
+      - name: Run hardening tests
+        run: ./tests/hardening.sh
+
+      - name: Run code-mode tests
+        run: ./tests/code.sh
