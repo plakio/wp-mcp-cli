@@ -35,7 +35,7 @@ Adding a new ability (`wp_register_ability()` with `meta.show_in_rest => true`) 
 - `gum` — `brew install gum` or `pacman -S gum`
 - `jq` — `brew install jq`
 - `curl`
-- `php` ≥ 8.0 — only for `wp-mcp code`
+- `php` ≥ 8.0, `python3` ≥ 3.8, or `node` ≥ 18 — only for `wp-mcp code`; pick the runtime you need
 
 ## Installation
 
@@ -89,11 +89,16 @@ wp-mcp version
 
 ## Code mode
 
-`wp-mcp code` runs a local PHP script that calls abilities through the same
-REST path as `wp-mcp run`. The script runs on your machine; it is **not** a
+`wp-mcp code` runs a local script that calls abilities through the same REST
+path as `wp-mcp run`. The script runs on your machine; it is **not** a
 sandbox, and it has your local user's permissions. Use it for loops,
 pagination, audits and batch work where intermediate data should not flow
 through the model.
+
+The script can be PHP, Python 3.8+ or Node 18+. The runtime is inferred from
+the file extension (`.php`, `.py`, `.js`, `.mjs`, `.cjs`) or selected with
+`--runtime`. The common bridge uses Bash, `jq` and `curl`, so Python and Node
+users do not need PHP.
 
 ```php
 <?php
@@ -109,6 +114,9 @@ wp-mcp code migrate.php --read-only
 
 # Review the plan, then execute it.
 wp-mcp code migrate.php --yes
+
+# Or allow only specific destructive abilities.
+wp-mcp code migrate.php --allow wp-mcp/content-delete-post
 ```
 
 Modes:
@@ -121,9 +129,11 @@ Modes:
 | `--yes` | execute | execute | execute |
 
 `--dry-run` still performs metadata calls (`wp_mcp_search` / `wp_mcp_describe`).
-Use `--read-only` when the plan needs real data. The CLI does not pass the
-application password to the script or its child processes; the script reaches
-the site through the same `wp-mcp run` path.
+Use `--read-only` when the plan needs real data. `--allow <ability>` is
+repeatable, can be used instead of `--yes` for least privilege, and cannot be
+combined with `--yes`. The CLI does not pass the application password to the
+script or its child processes; the script reaches the site through the common
+bridge and the same `wp-mcp run` path.
 
 ## Global flags
 
@@ -160,7 +170,7 @@ Error (STDERR in `--json` mode):
 
 ```
 main              # globals, setup, command router
-shared/           # shared helpers (paths, config, auth, http, output, ui, url, code)
+shared/           # shared helpers (paths, config, auth, http, output, ui, url, code, code-bridge, code-clients)
 commands/         # command functions (auth, sites, discover, describe, run, code, doctor, skill)
 compile.sh        # builds wp-mcp.sh
 install.sh        # local installer
@@ -176,7 +186,7 @@ tests/            # hardening, code mode and live-site smoke tests
 ./compile.sh
 bash -n main shared/*.sh commands/*
 ./tests/hardening.sh   # no site required
-./tests/code.sh        # no site required
+./tests/code.sh        # no site required (PHP, Python and Node clients)
 ./tests/smoke.sh       # requires WPMCP_TEST_URL/USER/PASSWORD
 ```
 

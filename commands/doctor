@@ -41,7 +41,17 @@ wpmcp_doctor() {
     if wpmcp_check_php; then
         results+=("OK|php available (code)|")
     else
-        results+=("WARN|php available (code)|PHP >= 8.0 with proc_open is required for wp-mcp code")
+        results+=("WARN|php available (code)|PHP >= 8.0 with proc_open is required for --runtime php")
+    fi
+    if wpmcp_check_python; then
+        results+=("OK|python3 available (code)|")
+    else
+        results+=("WARN|python3 available (code)|Python 3.8+ is required for --runtime python")
+    fi
+    if wpmcp_check_node; then
+        results+=("OK|node available (code)|")
+    else
+        results+=("WARN|node available (code)|Node.js 18+ is required for --runtime node")
     fi
 
     if [ "$offline" = "0" ]; then
@@ -108,6 +118,16 @@ wpmcp_check_php() {
     php -r 'exit(PHP_VERSION_ID >= 80000 ? 0 : 1);' >/dev/null 2>&1 || return 1
     php -r 'exit(function_exists("proc_open") ? 0 : 1);' >/dev/null 2>&1 || return 1
     return 0
+}
+
+wpmcp_check_python() {
+    wpmcp_command_exists python3 || return 1
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1
+}
+
+wpmcp_check_node() {
+    wpmcp_command_exists node || return 1
+    node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 18 ? 0 : 1)' >/dev/null 2>&1
 }
 
 wpmcp_check_active_site() {

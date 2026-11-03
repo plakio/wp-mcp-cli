@@ -14,6 +14,8 @@ wpmcp_code() {
     local max_calls=100
     local timeout=120
     local verbose=0
+    local runtime=""
+    local allow_list=()
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -53,6 +55,28 @@ wpmcp_code() {
                 ;;
             --verbose)
                 verbose=1
+                shift
+                ;;
+            --runtime)
+                if [ "$#" -lt 2 ]; then
+                    wpmcp_error_usage "--runtime requires a value"
+                fi
+                runtime="$2"
+                shift 2
+                ;;
+            --runtime=*)
+                runtime="${1#--runtime=}"
+                shift
+                ;;
+            --allow)
+                if [ "$#" -lt 2 ]; then
+                    wpmcp_error_usage "--allow requires an ability name"
+                fi
+                allow_list+=("$2")
+                shift 2
+                ;;
+            --allow=*)
+                allow_list+=("${1#--allow=}")
                 shift
                 ;;
             --help|-h)
@@ -118,6 +142,29 @@ wpmcp_code() {
     if [ "$yes" = "1" ] && { [ "$dry_run" = "1" ] || [ "$read_only" = "1" ]; }; then
         wpmcp_error_usage "--yes cannot be combined with --dry-run or --read-only"
     fi
+    if [ "$yes" = "1" ] && [ "${#allow_list[@]}" -gt 0 ]; then
+        wpmcp_error_usage "--yes and --allow are mutually exclusive"
+    fi
+
+    local allowed
+    for allowed in "${allow_list[@]}"; do
+        if ! [[ "$allowed" =~ ^[a-z0-9-]+(/[a-z0-9-]+)+$ ]]; then
+            wpmcp_error_usage "Invalid --allow ability: $allowed"
+        fi
+    done
+
+    if [ -z "$runtime" ]; then
+        case "$script" in
+            *.php) runtime="php" ;;
+            *.py) runtime="python" ;;
+            *.js|*.mjs|*.cjs) runtime="node" ;;
+            *) runtime="php" ;;
+        esac
+    fi
+    case "$runtime" in
+        php|python|node) ;;
+        *) wpmcp_error_usage "Unknown runtime: $runtime" ;;
+    esac
 
     wpmcp_paths_init
     wpmcp_config_resolve_site
@@ -132,10 +179,9 @@ wpmcp_code() {
             "Active site has no siteUrl: $WPMCP_ACTIVE_SITE"
     fi
 
-    wpmcp_code_require_php
-    wpmcp_code_extract_bootstrap
-    local bootstrap
-    bootstrap=$(wpmcp_code_bootstrap_path)
+    wpmcp_code_require_runtime "$runtime"
+    local client_dir="$WPMCP_HOME/lib/code"
+    wpmcp_code_extract_clients "$runtime"
 
     local work_dir
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/wpmcp-code.XXXXXX") || \
@@ -147,9 +193,13 @@ wpmcp_code() {
     trap 'wpmcp_code_cleanup; exit 130' INT
     trap 'wpmcp_code_cleanup; exit 143' TERM
 
+    local script_ext="php"
+    [ "$runtime" = "python" ] && script_ext="py"
+    [ "$runtime" = "node" ] && script_ext="js"
+
     local script_path
     if [ "$script" = "-" ]; then
-        script_path="$work_dir/stdin.php"
+        script_path="$work_dir/stdin.$script_ext"
         if ! cat > "$script_path"; then
             wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
                 "Could not read the script from STDIN."
@@ -165,11 +215,13 @@ wpmcp_code() {
     local out_file="$work_dir/stdout"
     local err_file="$work_dir/stderr"
     local log_file="$work_dir/calls.jsonl"
+    local state_file="$work_dir/state.json"
     local timeout_flag="$work_dir/timed-out"
     : > "$out_file"
     : > "$err_file"
     : > "$log_file"
-    chmod 600 "$out_file" "$err_file" "$log_file"
+    printf '%s' '{"seq":0,"executions":0,"total_calls":0,"annotations":{},"definitions":{}}' > "$state_file"
+    chmod 600 "$out_file" "$err_file" "$log_file" "$state_file"
 
     local sha
     sha=$(wpmcp_code_sha256 "$script_path")
@@ -178,25 +230,37 @@ wpmcp_code() {
         local display="$script"
         [ "$script" = "-" ] && display="<stdin>"
         printf 'Script: %s (sha256 %s)\n' "$display" "$sha" >&2
+        printf 'Runtime: %s\n' "$runtime" >&2
     fi
 
     export WPMCP_CODE_CLI="${WPMCP_CODE_CLI:-$(wpmcp_code_cli_path)}"
+    export WPMCP_CODE_BRIDGE_CLI="$(wpmcp_code_cli_path)"
     export WPMCP_CODE_SITE="$WPMCP_ACTIVE_SITE"
     export WPMCP_CODE_SITE_URL="$site_url"
     export WPMCP_CODE_ORIGIN="${WPMCP_ACTIVE_ORIGIN:-}"
     export WPMCP_CODE_LOG="$log_file"
+    export WPMCP_CODE_STATE="$state_file"
+    export WPMCP_CODE_STARTED_AT="$(date +%s)"
+    export WPMCP_CODE_SCRIPT="$script_path"
+    export WPMCP_CODE_RUNTIME="$runtime"
     export WPMCP_CODE_DRY_RUN="$dry_run"
     export WPMCP_CODE_READ_ONLY="$read_only"
     export WPMCP_CODE_ALLOW_DESTRUCTIVE="$yes"
     export WPMCP_CODE_MAX_CALLS="$max_calls"
     export WPMCP_CODE_TIMEOUT="$timeout"
     export WPMCP_CODE_VERBOSE="$verbose"
+    if [ "${#allow_list[@]}" -gt 0 ]; then
+        WPMCP_CODE_ALLOW=$(printf '%s\n' "${allow_list[@]}")
+        export WPMCP_CODE_ALLOW
+    else
+        export WPMCP_CODE_ALLOW=""
+    fi
     if [ -n "${WPMCP_HTTP_TIMEOUT:-}" ]; then
         export WPMCP_HTTP_TIMEOUT
     fi
 
     local status=0
-    wpmcp_code_run_php "$script_path" "$bootstrap" "$out_file" "$err_file" "$timeout" "$timeout_flag" || status=$?
+    wpmcp_code_run_runtime "$runtime" "$script_path" "$client_dir" "$out_file" "$err_file" "$timeout" "$timeout_flag" || status=$?
 
     local timed_out=0
     [ -f "$timeout_flag" ] && timed_out=1

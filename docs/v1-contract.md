@@ -162,25 +162,34 @@ Local JSON validation MUST occur before any network call.
 wp-mcp code <file|-> [--dry-run|--read-only|--yes] [--max-calls <n>] [--timeout <s>] [--verbose]
 ```
 
-Runs a local PHP 8.0+ script that calls abilities through the same REST shim
-as `wp-mcp run`. The script is local code, not a sandbox.
+Runs a local PHP 8.0+, Python 3.8+ or Node 18+ script that calls abilities
+through the same REST shim as `wp-mcp run`. The script is local code, not a
+sandbox.
 
 | Flag | Default | Effect |
 | ---- | ------- | ------ |
 | `--dry-run` | off | Stub every ability call. Metadata search/describe still run. |
 | `--read-only` | off | Execute only `readonly=true` abilities; stub all writes. |
-| `--yes` / `-y` | off | Allow `destructive=true` abilities. |
+| `--yes` / `-y` | off | Allow all `destructive=true` abilities. |
+| `--allow <ability>` | none | Allow one destructive ability. Repeatable; cannot be combined with `--yes`. |
+| `--runtime <r>` | inferred | `php`, `python` or `node`. Inferred from `.php`, `.py`, `.js`, `.mjs`, `.cjs`; stdin defaults to `php`. |
 | `--max-calls <n>` | 100 | Maximum ability calls, 1–1000. |
 | `--timeout <s>` | 120 | Wall-clock limit, 1–3600. |
 | `--verbose` | off | Print one line per call in human mode. |
 
 Without a mode flag, readonly abilities and non-destructive writes execute;
-a destructive call exits 6 unless `--yes` is set. `--dry-run`, `--read-only`
-and `--yes` are mutually exclusive where they overlap. `--json` does not
-imply `--yes`. `--yes` only permits a destructive call; it does not inject
-the ability's `confirm_*` arguments. `--quiet` suppresses the script's
-stdout/stderr and the human summary; with `--json` the envelope is still
-emitted.
+a destructive call exits 6 unless `--yes` or a matching `--allow` is set.
+`--dry-run`, `--read-only` and `--yes` are mutually exclusive where they
+overlap. `--json` does not imply `--yes`. `--yes` and `--allow` only permit
+a destructive call; they do not inject the ability's `confirm_*` arguments.
+`--quiet` suppresses the script's stdout/stderr and the human summary; with
+`--json` the envelope is still emitted.
+
+The script runtime is independent of the Bash CLI. PHP, Python and Node
+clients all talk to the same local bridge (`wp-mcp __code-bridge`), which
+owns modes, budgets, annotation resolution and the call log. The bridge uses
+the existing `wp-mcp run`/`describe` commands, so Python and Node users do
+not need PHP.
 
 The script API is `wp_mcp_call()`, `wp_mcp_search()`, `wp_mcp_discover()`,
 `wp_mcp_describe()`, `wp_mcp_log()`, `wp_mcp_is_dry_run()`,

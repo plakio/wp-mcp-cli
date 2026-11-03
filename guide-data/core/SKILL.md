@@ -34,7 +34,8 @@ wp-mcp run wp-mcp/list-directory --input '{"path":"/Users"}'
 
 ## Code mode (multi-step work)
 
-For loops, pagination, audits or batch updates, write a local PHP script:
+For loops, pagination, audits or batch updates, write a local script (PHP,
+Python 3.8+ or Node 18+):
 
 ```php
 <?php
@@ -50,10 +51,13 @@ wp-mcp code audit.php --read-only
 
 # Execute only after explicit approval.
 wp-mcp code audit.php --yes
+# Or allow only specific destructive abilities.
+wp-mcp code audit.php --allow wp-mcp/content-delete-post
 ```
 
 The script runs on the local machine, not the WordPress site, and is not a
-sandbox. Use `--max-calls` and `--timeout` for large scripts. See
+sandbox. The runtime is inferred from the extension or selected with
+`--runtime`. Use `--max-calls` and `--timeout` for large scripts. See
 `skills/wp-mcp/SKILL.md` for the full code-mode workflow.
 
 ## Rules of engagement
@@ -64,7 +68,8 @@ sandbox. Use `--max-calls` and `--timeout` for large scripts. See
   the user explicitly approved.
 - **Prefer `--json`** for any output the agent will parse.
 - **For multi-step work**, use `wp-mcp code --read-only` to build a plan from
-  real data, then `--yes` only after explicit approval.
+  real data, then `--yes` or a specific `--allow <ability>` only after explicit
+  approval.
 - **Branch on `error.code`** rather than parsing `error.message`.
 - **Site selection**: do not assume a profile. Use `wp-mcp --json sites list`
   to discover the available sites, then pick one explicitly with `--site`

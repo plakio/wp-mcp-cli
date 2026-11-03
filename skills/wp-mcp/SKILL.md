@@ -119,14 +119,18 @@ The canonical workflow for an agent:
 ## Code mode
 
 Use `wp-mcp code` when a task needs loops, conditionals, pagination or many
-ability calls. The PHP script runs on the local machine and calls the same
-REST shim as `wp-mcp run`; the site's access rules still apply.
+ability calls. The script runs on the local machine and calls the same REST
+shim as `wp-mcp run`; the site's access rules still apply.
 
-1. **Plan.** Write a PHP script using `wp_mcp_search()`, `wp_mcp_describe()`,
+Scripts can be PHP, Python 3.8+ or Node 18+. The runtime is inferred from
+the extension (`.php`, `.py`, `.js`, `.mjs`, `.cjs`) or set with `--runtime`.
+
+1. **Plan.** Write a script using `wp_mcp_search()`, `wp_mcp_describe()`,
    `wp_mcp_call()` and `wp_mcp_log()`. Show the script to the human.
 2. **Read.** Run it with `--read-only`. Reads execute; every write is stubbed
    and appears in `data.calls` as `skipped`.
-3. **Approve.** Review the plan. Only then run with `--yes`.
+3. **Approve.** Review the plan. Only then run with `--yes`, or with
+   `--allow <ability>` for specific destructive abilities.
 4. **Bound it.** Use `--max-calls` and `--timeout` for large scripts.
 
 ```php
@@ -140,13 +144,15 @@ foreach ($rows as $row) {
 Modes:
 
 - default: reads and non-destructive writes execute; destructive abilities
-  exit 6 unless `--yes`.
+  exit 6 unless `--yes` or a matching `--allow` is present.
 - `--read-only`: only `readonly=true` abilities execute; all writes are
   stubbed. This is the mode for a real-data plan.
 - `--dry-run`: every ability call is stubbed. Metadata search/describe still
   run; use this only when the script does not need real data.
-- `--yes`: allow destructive abilities. It only permits the call; it does not
-  inject the ability's `confirm_*` argument, so pass that explicitly.
+- `--yes`: allow all destructive abilities. It only permits the call; it does
+  not inject the ability's `confirm_*` argument, so pass that explicitly.
+- `--allow <ability>`: allow one destructive ability. Repeatable; cannot be
+  combined with `--yes`. Prefer it over `--yes` for least privilege.
 
 The script is **not** a sandbox. It has the local user's permissions and can
 read local files or make network requests. Review agent-generated scripts
@@ -208,7 +214,8 @@ When editing wp-mcp-cli:
 1. Read `AGENTS.md` first.
 2. Compile after source edits: `./compile.sh`.
 3. Validate: `bash -n main shared/* commands/* compile.sh install.sh wp-mcp.sh`.
-4. Run the no-site tests: `./tests/hardening.sh` and `./tests/code.sh`.
+4. Run the no-site tests: `./tests/hardening.sh` and `./tests/code.sh`
+   (the latter covers the PHP, Python and Node clients).
 5. Smoke test against a real site: `./tests/smoke.sh` (when present).
 6. CI runs `tests/hardening.sh` and `tests/code.sh` on push and pull
    requests; the live smoke test is manual.

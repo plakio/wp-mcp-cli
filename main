@@ -192,18 +192,23 @@ HELP
 Usage:
   wp-mcp code <file|-> [flags]
 
-Runs a local PHP script that calls WP-MCP abilities through the CLI's
-existing REST path. The script runs on your machine; it is not a sandbox.
+Runs a local PHP, Python or Node script that calls WP-MCP abilities through
+the CLI's existing REST path. The script runs on your machine; it is not a
+sandbox.
 
 Modes:
   (default)       execute reads and non-destructive writes. Destructive
-                  abilities require --yes.
+                  abilities require --yes or --allow.
   --read-only     execute only abilities marked readonly=true; stub writes.
   --dry-run       stub every ability call; metadata search/describe still run.
-  --yes, -y       allow destructive abilities. It does not inject the
+  --yes, -y       allow all destructive abilities. It does not inject the
                   ability's confirm_* arguments; pass them explicitly.
+  --allow <name>  allow one destructive ability. Repeatable; cannot be
+                  combined with --yes.
 
 Flags:
+  --runtime <r>    php, python or node. Default: inferred from the file
+                   extension (.php, .py, .js/.mjs/.cjs); stdin defaults to php.
   --max-calls <n>  Maximum ability calls (1-1000, default 100).
   --timeout <sec>  Wall-clock limit (1-3600, default 120).
   --verbose        Print one line per call in human mode.
@@ -339,6 +344,9 @@ main() {
             ;;
         code)
             wpmcp_code "$@"
+            ;;
+        __code-bridge)
+            wpmcp_code_bridge
             ;;
         doctor)
             wpmcp_doctor "$@"

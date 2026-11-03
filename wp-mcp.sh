@@ -192,18 +192,23 @@ HELP
 Usage:
   wp-mcp code <file|-> [flags]
 
-Runs a local PHP script that calls WP-MCP abilities through the CLI's
-existing REST path. The script runs on your machine; it is not a sandbox.
+Runs a local PHP, Python or Node script that calls WP-MCP abilities through
+the CLI's existing REST path. The script runs on your machine; it is not a
+sandbox.
 
 Modes:
   (default)       execute reads and non-destructive writes. Destructive
-                  abilities require --yes.
+                  abilities require --yes or --allow.
   --read-only     execute only abilities marked readonly=true; stub writes.
   --dry-run       stub every ability call; metadata search/describe still run.
-  --yes, -y       allow destructive abilities. It does not inject the
+  --yes, -y       allow all destructive abilities. It does not inject the
                   ability's confirm_* arguments; pass them explicitly.
+  --allow <name>  allow one destructive ability. Repeatable; cannot be
+                  combined with --yes.
 
 Flags:
+  --runtime <r>    php, python or node. Default: inferred from the file
+                   extension (.php, .py, .js/.mjs/.cjs); stdin defaults to php.
   --max-calls <n>  Maximum ability calls (1-1000, default 100).
   --timeout <sec>  Wall-clock limit (1-3600, default 120).
   --verbose        Print one line per call in human mode.
@@ -340,6 +345,9 @@ main() {
         code)
             wpmcp_code "$@"
             ;;
+        __code-bridge)
+            wpmcp_code_bridge
+            ;;
         doctor)
             wpmcp_doctor "$@"
             ;;
@@ -454,101 +462,606 @@ wpmcp_auth_require() {
     export WPMCP_ACTIVE_USER
 }
 
-# Source: shared/code.sh
+# Source: shared/code-bridge.sh
 # SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# Code mode helpers: PHP bootstrap extraction, execution and rendering.
-# The user script runs locally. It is not a sandbox.
+# Common code-mode bridge.
+#
+# The hidden `wp-mcp __code-bridge` command reads one JSON request from STDIN
+# and returns one JSON response on STDOUT (success) or STDERR (error). It owns
+# the modes, budgets, annotation cache and call log, so the PHP, Python and
+# Node clients can stay thin. It only needs Bash, jq and the wp-mcp CLI.
+#
+# Stateful functions are called directly, not through command substitutions,
+# so STATE, budgets and error propagation stay in one shell.
 
-# Bump this whenever the embedded PHP bootstrap changes so existing
-# installations rewrite $WPMCP_HOME/lib/code-bootstrap.php.
-WPMCP_CODE_BOOTSTRAP_VERSION="1"
-WPMCP_CODE_OUTPUT_LIMIT=1048576
-WPMCP_CODE_WORK_DIR=""
-WPMCP_CODE_PHP_PID=""
-WPMCP_CODE_WATCHDOG_PID=""
+wpmcp_code_bridge() {
+    local request op
+    request=$(cat)
+    op=$(printf '%s' "$request" | jq -r '.op // empty' 2>/dev/null || true)
 
-wpmcp_code_cleanup() {
-    if [ -n "${WPMCP_CODE_PHP_PID:-}" ] && kill -0 "$WPMCP_CODE_PHP_PID" 2>/dev/null; then
-        kill -TERM -- "-$WPMCP_CODE_PHP_PID" 2>/dev/null || kill "$WPMCP_CODE_PHP_PID" 2>/dev/null || true
-    fi
-    if [ -n "${WPMCP_CODE_WATCHDOG_PID:-}" ] && kill -0 "$WPMCP_CODE_WATCHDOG_PID" 2>/dev/null; then
-        kill -TERM -- "-$WPMCP_CODE_WATCHDOG_PID" 2>/dev/null || kill "$WPMCP_CODE_WATCHDOG_PID" 2>/dev/null || true
-    fi
-    if [ -n "${WPMCP_CODE_WORK_DIR:-}" ]; then
-        rm -rf "$WPMCP_CODE_WORK_DIR"
-    fi
-}
+    case "$op" in
+        call|search|discover|describe|log) ;;
+        *) wpmcp_code_bridge_error "usage_error" "Unknown code bridge operation." 2 ;;
+    esac
 
-wpmcp_code_require_php() {
-    wpmcp_command_exists php || wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
-        "PHP is required for 'wp-mcp code'."
-    if ! php -r 'exit(PHP_VERSION_ID >= 80000 ? 0 : 1);' >/dev/null 2>&1; then
-        wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
-            "PHP >= 8.0 is required for 'wp-mcp code'."
+    if [ -z "${WPMCP_CODE_STATE:-}" ] || [ ! -f "$WPMCP_CODE_STATE" ]; then
+        wpmcp_code_bridge_error "internal_error" "Code bridge state is missing." 1
     fi
-    if ! php -r 'exit(function_exists("proc_open") ? 0 : 1);' >/dev/null 2>&1; then
-        wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
-            "PHP proc_open() is disabled; 'wp-mcp code' requires it."
+    if [ -z "${WPMCP_CODE_LOG:-}" ] || [ ! -f "$WPMCP_CODE_LOG" ]; then
+        wpmcp_code_bridge_error "internal_error" "Code bridge log is missing." 1
     fi
-}
+    if [ -z "${WPMCP_CODE_CLI:-}" ] || [ ! -f "$WPMCP_CODE_CLI" ]; then
+        wpmcp_code_bridge_error "internal_error" "Code bridge CLI is missing." 1
+    fi
 
-wpmcp_code_cli_path() {
-    local cli="${BASH_SOURCE[0]:-$0}"
-    case "$cli" in
-        /*) printf '%s' "$cli" ;;
-        *) printf '%s/%s' "$(cd "$(dirname "$cli")" && pwd)" "$(basename "$cli")" ;;
+    if [ -x "$WPMCP_CODE_CLI" ]; then
+        WPMCP_CODE_BRIDGE_CMD=("$WPMCP_CODE_CLI")
+    else
+        WPMCP_CODE_BRIDGE_CMD=(bash "$WPMCP_CODE_CLI")
+    fi
+
+    wpmcp_code_bridge_lock
+    trap wpmcp_code_bridge_unlock EXIT
+
+    STATE=$(wpmcp_code_bridge_state_read)
+
+    case "$op" in
+        call)
+            local ability input
+            ability=$(printf '%s' "$request" | jq -r '.ability // empty')
+            input=$(printf '%s' "$request" | jq -c '.input // null')
+            wpmcp_code_bridge_call "$ability" "$input"
+            ;;
+        search)
+            local query limit cursor options
+            query=$(printf '%s' "$request" | jq -r '.query // ""')
+            limit=$(printf '%s' "$request" | jq -r '.limit // 10')
+            cursor=$(printf '%s' "$request" | jq -r '.cursor // empty')
+            options=$(jq -nc \
+                --arg q "$query" \
+                --argjson l "$limit" \
+                --arg c "$cursor" \
+                '{query:$q,limit:$l} + (if $c == "" then {} else {cursor:$c} end)')
+            wpmcp_code_bridge_discover "$options"
+            printf '%s' "$WPMCP_CODE_BRIDGE_RESULT" | jq -c '.abilities // []' | wpmcp_code_bridge_ok_stdin
+            ;;
+        discover)
+            local options
+            options=$(printf '%s' "$request" | jq -c '.options // {}')
+            wpmcp_code_bridge_discover "$options"
+            wpmcp_code_bridge_ok "$WPMCP_CODE_BRIDGE_RESULT"
+            ;;
+        describe)
+            local ability
+            ability=$(printf '%s' "$request" | jq -r '.ability // empty')
+            wpmcp_code_bridge_describe "$ability"
+            wpmcp_code_bridge_ok "$WPMCP_CODE_BRIDGE_DEFINITION"
+            ;;
+        log)
+            local message
+            message=$(printf '%s' "$request" | jq -r '.message // ""')
+            wpmcp_code_bridge_log_event "$(jq -nc --arg m "$message" '{type:"log",message:$m}')"
+            wpmcp_code_bridge_ok "null"
+            ;;
     esac
 }
 
-wpmcp_code_sha256() {
-    local file="$1"
-    if wpmcp_command_exists sha256sum; then
-        sha256sum "$file" | awk '{print $1}'
-    elif wpmcp_command_exists shasum; then
-        shasum -a 256 "$file" | awk '{print $1}'
-    else
-        wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
-            "No SHA-256 tool is available."
-    fi
-}
-
-wpmcp_code_bootstrap_path() {
-    wpmcp_paths_init
-    printf '%s/lib/code-bootstrap.php' "$WPMCP_HOME"
-}
-
-wpmcp_code_extract_bootstrap() {
-    local lib_dir="$WPMCP_HOME/lib"
-    local target="$lib_dir/code-bootstrap.php"
-    local version_file="$lib_dir/code-bootstrap.version"
-    local tmp="$target.tmp.$$"
-
-    mkdir -p "$lib_dir" || wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
-        "Cannot create $lib_dir."
-    chmod 700 "$lib_dir" 2>/dev/null || true
-
-    if [ -f "$target" ] && [ -f "$version_file" ] &&
-        [ "$(cat "$version_file" 2>/dev/null)" = "$WPMCP_CODE_BOOTSTRAP_VERSION" ]; then
+wpmcp_code_bridge_lock() {
+    if wpmcp_command_exists flock; then
+        exec 9>"${WPMCP_CODE_STATE}.lock"
+        flock -w 10 9 || wpmcp_code_bridge_error "internal_error" "Could not lock code bridge state." 1
         return 0
     fi
 
-    cat > "$tmp" <<'WPMCP_CODE_BOOTSTRAP'
-<?php
-// wp-mcp-cli code bootstrap (AGPL-3.0-or-later)
-// Version: 1
+    local lock="${WPMCP_CODE_STATE}.lock.d"
+    local i=0
+    while ! mkdir "$lock" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -gt 200 ]; then
+            rm -rf "$lock" 2>/dev/null || true
+            i=0
+        fi
+        sleep 0.05
+    done
+}
 
-if (defined('WPMCP_CODE_BOOTSTRAP')) {
+wpmcp_code_bridge_unlock() {
+    if ! wpmcp_command_exists flock; then
+        rmdir "${WPMCP_CODE_STATE}.lock.d" 2>/dev/null || true
+    fi
+}
+
+wpmcp_code_bridge_state_read() {
+    if [ ! -s "$WPMCP_CODE_STATE" ]; then
+        printf '%s' '{"seq":0,"executions":0,"total_calls":0,"annotations":{},"definitions":{}}'
+    else
+        cat "$WPMCP_CODE_STATE"
+    fi
+}
+
+wpmcp_code_bridge_state_write() {
+    local tmp="${WPMCP_CODE_STATE}.tmp.$$"
+    printf '%s' "$STATE" > "$tmp" && mv -f "$tmp" "$WPMCP_CODE_STATE"
+}
+
+wpmcp_code_bridge_ok() {
+    local data="$1"
+    printf '%s' "$data" | jq -c '{ok:true,data:.}'
+}
+
+wpmcp_code_bridge_ok_stdin() {
+    jq -c '{ok:true,data:.}'
+}
+
+wpmcp_code_bridge_error() {
+    local code="$1"
+    local message="$2"
+    local exit_code="${3:-5}"
+    local remote="${4:-}"
+    local details="${5:-}"
+    [ -n "$details" ] || details="{}"
+
+    jq -nc \
+        --arg code "$code" \
+        --arg message "$message" \
+        --argjson exit "$exit_code" \
+        --arg remote "$remote" \
+        --argjson details "$details" \
+        '{ok:false,error:{code:$code,message:$message,exitCode:$exit,remoteCode:$remote,details:$details}}' >&2
+    exit "$exit_code"
+}
+
+wpmcp_code_bridge_log_event() {
+    local event="$1"
+    printf '%s' "$event" | jq -c . >> "$WPMCP_CODE_LOG"
+}
+
+wpmcp_code_bridge_bytes() {
+    printf '%s' "$1" | wc -c | tr -d ' '
+}
+
+wpmcp_code_bridge_log_start() {
+    local seq="$1" ability="$2" kind="$3" readonly="$4" destructive="$5" bytes="$6"
+    wpmcp_code_bridge_log_event "$(jq -nc \
+        --argjson seq "$seq" \
+        --arg ability "$ability" \
+        --arg kind "$kind" \
+        --argjson readonly "$readonly" \
+        --argjson destructive "$destructive" \
+        --argjson bytes "$bytes" \
+        '{type:"call_start",seq:$seq,ability:$ability,kind:$kind,readonly:$readonly,destructive:$destructive,request_bytes:$bytes}')"
+}
+
+wpmcp_code_bridge_log_end() {
+    local seq="$1" ability="$2" kind="$3" status="$4" http="$5" duration="$6"
+    local req="$7" resp="$8" err="$9" readonly="${10}" destructive="${11}"
+
+    wpmcp_code_bridge_log_event "$(jq -nc \
+        --argjson seq "$seq" \
+        --arg ability "$ability" \
+        --arg kind "$kind" \
+        --arg status "$status" \
+        --argjson http "$http" \
+        --argjson duration "$duration" \
+        --argjson req "$req" \
+        --argjson resp "$resp" \
+        --arg err "$err" \
+        --argjson readonly "$readonly" \
+        --argjson destructive "$destructive" \
+        '{type:"call_end",seq:$seq,ability:$ability,kind:$kind,status:$status,http_status:$http,duration_ms:$duration,request_bytes:$req,response_bytes:$resp,error_code:(if $err == "" then null else $err end),readonly:$readonly,destructive:$destructive}')"
+}
+
+wpmcp_code_bridge_remaining() {
+    local timeout="${WPMCP_CODE_TIMEOUT:-120}"
+    local started="${WPMCP_CODE_STARTED_AT:-}"
+    [ -n "$started" ] || started=$(date +%s)
+    local now
+    now=$(date +%s)
+    local remaining=$((timeout - (now - started)))
+    if [ "$remaining" -lt 1 ]; then
+        return 1
+    fi
+    printf '%s' "$remaining"
+}
+
+wpmcp_code_bridge_claim_call() {
+    local kind="$1"
+    local max="${WPMCP_CODE_MAX_CALLS:-100}"
+    local total_max=$((max * 3))
+    [ "$total_max" -lt 50 ] && total_max=50
+
+    local total
+    total=$(printf '%s' "$STATE" | jq -r '.total_calls + 1')
+    if [ "$total" -gt "$total_max" ]; then
+        wpmcp_code_bridge_error "call_budget_exceeded" \
+            "Total call budget exceeded (max $total_max)." 5 "" \
+            "{\"max_total_calls\":$total_max}"
+    fi
+
+    local executions
+    if [ "$kind" = "call" ]; then
+        executions=$(printf '%s' "$STATE" | jq -r '.executions + 1')
+        if [ "$executions" -gt "$max" ]; then
+            wpmcp_code_bridge_error "call_budget_exceeded" \
+                "Call budget exceeded (max $max)." 5 "" \
+                "{\"max_calls\":$max}"
+        fi
+    else
+        executions=$(printf '%s' "$STATE" | jq -r '.executions')
+    fi
+
+    local seq
+    seq=$(printf '%s' "$STATE" | jq -r '.seq + 1')
+    STATE=$(printf '%s' "$STATE" | jq -c \
+        --argjson s "$seq" \
+        --argjson e "$executions" \
+        --argjson t "$total" \
+        '.seq=$s | .executions=$e | .total_calls=$t')
+    wpmcp_code_bridge_state_write
+    WPMCP_CODE_BRIDGE_SEQ="$seq"
+}
+
+wpmcp_code_bridge_child_run() {
+    local ability="$1"
+    local input="$2"
+    local remaining http_timeout rc=0 out err stderr envelope
+    remaining=$(wpmcp_code_bridge_remaining) || \
+        wpmcp_code_bridge_error "script_error" "Code mode timed out." 5
+    if [ "$remaining" -lt 30 ]; then
+        http_timeout=$remaining
+    else
+        http_timeout=30
+    fi
+
+    err="${WPMCP_CODE_STATE}.child.$$"
+    out=$(printf '%s' "$input" | \
+        WPMCP_QUIET=0 WPMCP_HTTP_TIMEOUT="$http_timeout" \
+        "${WPMCP_CODE_BRIDGE_CMD[@]}" --json run "$ability" --input - 2>"$err") || rc=$?
+    stderr=$(cat "$err" 2>/dev/null || true)
+    rm -f "$err"
+
+    envelope=$(printf '%s' "$out" | jq -c . 2>/dev/null || true)
+    if [ "$rc" -eq 0 ] && printf '%s' "$envelope" | jq -e '.ok == true' >/dev/null 2>&1; then
+        WPMCP_CODE_BRIDGE_HTTP_STATUS=$(printf '%s' "$envelope" | jq -r '.meta.http_status // 200')
+        WPMCP_CODE_BRIDGE_DATA=$(printf '%s' "$envelope" | jq -c '.data')
+        return 0
+    fi
+
+    wpmcp_code_bridge_raise_child "$rc" "$stderr"
+}
+
+wpmcp_code_bridge_child_describe() {
+    local ability="$1"
+    local remaining http_timeout rc=0 out err stderr envelope
+    remaining=$(wpmcp_code_bridge_remaining) || \
+        wpmcp_code_bridge_error "script_error" "Code mode timed out." 5
+    if [ "$remaining" -lt 30 ]; then
+        http_timeout=$remaining
+    else
+        http_timeout=30
+    fi
+    err="${WPMCP_CODE_STATE}.child.$$"
+    out=$(WPMCP_QUIET=0 WPMCP_HTTP_TIMEOUT="$http_timeout" \
+        "${WPMCP_CODE_BRIDGE_CMD[@]}" --json describe "$ability" 2>"$err") || rc=$?
+    stderr=$(cat "$err" 2>/dev/null || true)
+    rm -f "$err"
+
+    envelope=$(printf '%s' "$out" | jq -c . 2>/dev/null || true)
+    if [ "$rc" -eq 0 ] && printf '%s' "$envelope" | jq -e '.ok == true' >/dev/null 2>&1; then
+        WPMCP_CODE_BRIDGE_HTTP_STATUS=$(printf '%s' "$envelope" | jq -r '.meta.http_status // 200')
+        WPMCP_CODE_BRIDGE_DATA=$(printf '%s' "$envelope" | jq -c '.data')
+        return 0
+    fi
+
+    wpmcp_code_bridge_raise_child "$rc" "$stderr"
+}
+
+wpmcp_code_bridge_raise_child() {
+    local rc="$1"
+    local stderr="$2"
+    local error code message remote details exit_code
+
+    error=$(printf '%s' "$stderr" | jq -c '.error // empty' 2>/dev/null || true)
+    if [ -z "$error" ]; then
+        code="script_error"
+        message="The wp-mcp child process failed."
+        exit_code=5
+        remote=""
+        details=$(printf '%s' "$stderr" | tail -c 2000 | jq -Rsc '{stderr:.}')
+    else
+        code=$(printf '%s' "$error" | jq -r '.code // "script_error"')
+        message=$(printf '%s' "$error" | jq -r '.message // "The wp-mcp child process failed."')
+        remote=$(printf '%s' "$error" | jq -r '.remoteCode // ""')
+        details=$(printf '%s' "$error" | jq -c '.details // {}')
+        case "$rc" in
+            ''|*[!0-9]*) exit_code=5 ;;
+            *) exit_code=$rc ;;
+        esac
+        [ "$exit_code" -gt 0 ] 2>/dev/null || exit_code=5
+
+        case "$code" in
+            wp_mcp_ability_not_found|wp_mcp_ability_hidden|rest_ability_not_found)
+                remote="$code"
+                code="ability_not_found"
+                exit_code=2
+                ;;
+            wp_mcp_invalid_input|wp_mcp_missing_field)
+                remote="$code"
+                code="schema_validation_failed"
+                exit_code=5
+                ;;
+            wp_mcp_forbidden|wp_mcp_disabled)
+                remote="$code"
+                code="auth_denied"
+                exit_code=3
+                ;;
+        esac
+        if [ -z "$remote" ] && [ "${code#wp_mcp_}" != "$code" ]; then
+            remote="$code"
+        fi
+    fi
+
+    wpmcp_code_bridge_error "$code" "$message" "$exit_code" "$remote" "$details"
+}
+
+wpmcp_code_bridge_valid_ability() {
+    [[ "$1" =~ ^[a-z0-9-]+(/[a-z0-9-]+)+$ ]]
+}
+
+wpmcp_code_bridge_annotations() {
+    local ability="$1"
+    local cached
+    cached=$(printf '%s' "$STATE" | jq -c --arg a "$ability" '.annotations[$a] // empty')
+    if [ -n "$cached" ]; then
+        WPMCP_CODE_BRIDGE_ANNOTATIONS="$cached"
+        return 0
+    fi
+    wpmcp_code_bridge_describe "$ability"
+    WPMCP_CODE_BRIDGE_ANNOTATIONS=$(printf '%s' "$WPMCP_CODE_BRIDGE_DEFINITION" | jq -c '.meta.annotations // {}')
+}
+
+wpmcp_code_bridge_describe() {
+    local ability="$1"
+    local cached seq bytes start duration definition annotations http
+    if ! wpmcp_code_bridge_valid_ability "$ability"; then
+        wpmcp_code_bridge_error "usage_error" "Invalid ability name: $ability" 2 "" \
+            "{\"ability\":\"$ability\"}"
+    fi
+    cached=$(printf '%s' "$STATE" | jq -c --arg a "$ability" '.definitions[$a] // empty')
+    if [ -n "$cached" ]; then
+        WPMCP_CODE_BRIDGE_DEFINITION="$cached"
+        return 0
+    fi
+
+    wpmcp_code_bridge_claim_call "describe"
+    seq="$WPMCP_CODE_BRIDGE_SEQ"
+    bytes=$(wpmcp_code_bridge_bytes "$(jq -nc --arg a "$ability" '{ability_name:$a}')")
+    start=$(date +%s)
+    wpmcp_code_bridge_log_start "$seq" "$ability" "describe" true false "$bytes"
+
+    wpmcp_code_bridge_child_describe "$ability"
+    definition="$WPMCP_CODE_BRIDGE_DATA"
+    http="${WPMCP_CODE_BRIDGE_HTTP_STATUS:-200}"
+    annotations=$(printf '%s' "$definition" | jq -c '.meta.annotations // {}')
+    STATE=$(printf '%s' "$STATE" | jq -c \
+        --arg a "$ability" \
+        --argjson d "$definition" \
+        --argjson an "$annotations" \
+        '.definitions[$a]=$d | .annotations[$a]=$an')
+    wpmcp_code_bridge_state_write
+
+    duration=$((($(date +%s) - start) * 1000))
+    wpmcp_code_bridge_log_end "$seq" "$ability" "describe" "ok" "$http" "$duration" \
+        "$bytes" "$(wpmcp_code_bridge_bytes "$definition")" "" true false
+    WPMCP_CODE_BRIDGE_DEFINITION="$definition"
+}
+
+wpmcp_code_bridge_discover() {
+    local options="$1"
+    local seq bytes start duration result http
+    wpmcp_code_bridge_claim_call "search"
+    seq="$WPMCP_CODE_BRIDGE_SEQ"
+    bytes=$(wpmcp_code_bridge_bytes "$options")
+    start=$(date +%s)
+    wpmcp_code_bridge_log_start "$seq" "mcp-adapter/discover-abilities" "search" true false "$bytes"
+
+    wpmcp_code_bridge_child_run "mcp-adapter/discover-abilities" "$options"
+    result="$WPMCP_CODE_BRIDGE_DATA"
+    http="${WPMCP_CODE_BRIDGE_HTTP_STATUS:-200}"
+    STATE=$(printf '%s' "$STATE" | jq -c --argjson r "$result" '
+        reduce ($r.abilities // [])[] as $row (.;
+            if ($row.name // "") != "" and (($row.readonly // null) != null or ($row.destructive // null) != null) then
+                .annotations[$row.name] = {
+                    readonly: ($row.readonly // false),
+                    destructive: (if $row.destructive == null then true else ($row.destructive == true) end)
+                }
+            else . end
+        )')
+    wpmcp_code_bridge_state_write
+
+    duration=$((($(date +%s) - start) * 1000))
+    wpmcp_code_bridge_log_end "$seq" "mcp-adapter/discover-abilities" "search" "ok" "$http" "$duration" \
+        "$bytes" "$(wpmcp_code_bridge_bytes "$result")" "" true false
+    WPMCP_CODE_BRIDGE_RESULT="$result"
+}
+
+wpmcp_code_bridge_is_allowed() {
+    local ability="$1"
+    [ -n "${WPMCP_CODE_ALLOW:-}" ] || return 1
+    printf '%s\n' "$WPMCP_CODE_ALLOW" | grep -Fxq -- "$ability"
+}
+
+wpmcp_code_bridge_call() {
+    local ability="$1"
+    local input="$2"
+    local seq bytes start duration annotations readonly destructive result http
+    if ! wpmcp_code_bridge_valid_ability "$ability"; then
+        wpmcp_code_bridge_error "usage_error" "Invalid ability name: $ability" 2 "" \
+            "{\"ability\":\"$ability\"}"
+    fi
+    wpmcp_code_bridge_claim_call "call"
+    seq="$WPMCP_CODE_BRIDGE_SEQ"
+    bytes=$(wpmcp_code_bridge_bytes "$input")
+    wpmcp_code_bridge_annotations "$ability"
+    annotations="$WPMCP_CODE_BRIDGE_ANNOTATIONS"
+    readonly=$(printf '%s' "$annotations" | jq -r 'if .readonly == true then "true" else "false" end')
+    destructive=$(printf '%s' "$annotations" | jq -r \
+        'if has("destructive") then (if .destructive == true then "true" else "false" end) else "true" end')
+
+    start=$(date +%s)
+    wpmcp_code_bridge_log_start "$seq" "$ability" "call" "$readonly" "$destructive" "$bytes"
+
+    if [ "${WPMCP_CODE_DRY_RUN:-0}" = "1" ]; then
+        duration=$((($(date +%s) - start) * 1000))
+        wpmcp_code_bridge_log_end "$seq" "$ability" "call" "dry_run" null "$duration" "$bytes" 0 "" "$readonly" "$destructive"
+        wpmcp_code_bridge_ok "$(jq -nc --arg a "$ability" --argjson i "$input" \
+            '{__wp_mcp_dry_run:true,ability:$a,input:$i}')"
+        return 0
+    fi
+
+    if [ "${WPMCP_CODE_READ_ONLY:-0}" = "1" ] && [ "$readonly" != "true" ]; then
+        duration=$((($(date +%s) - start) * 1000))
+        wpmcp_code_bridge_log_end "$seq" "$ability" "call" "skipped" null "$duration" "$bytes" 0 "" "$readonly" "$destructive"
+        wpmcp_code_bridge_ok "$(jq -nc --arg a "$ability" \
+            '{__wp_mcp_skipped:true,ability:$a,reason:"not_readonly"}')"
+        return 0
+    fi
+
+    if [ "$destructive" = "true" ] &&
+        [ "${WPMCP_CODE_ALLOW_DESTRUCTIVE:-0}" != "1" ] &&
+        ! wpmcp_code_bridge_is_allowed "$ability"; then
+        duration=$((($(date +%s) - start) * 1000))
+        wpmcp_code_bridge_log_end "$seq" "$ability" "call" "blocked" null "$duration" "$bytes" 0 "" "$readonly" "$destructive"
+        wpmcp_code_bridge_error "confirmation_required" \
+            "Ability '$ability' is destructive. Re-run with --yes or --allow $ability." 6 "" \
+            "{\"ability\":\"$ability\",\"seq\":$seq}"
+    fi
+
+    wpmcp_code_bridge_child_run "$ability" "$input"
+    result="$WPMCP_CODE_BRIDGE_DATA"
+    http="${WPMCP_CODE_BRIDGE_HTTP_STATUS:-200}"
+    duration=$((($(date +%s) - start) * 1000))
+    wpmcp_code_bridge_log_end "$seq" "$ability" "call" "ok" "$http" "$duration" \
+        "$bytes" "$(wpmcp_code_bridge_bytes "$result")" "" "$readonly" "$destructive"
+    wpmcp_code_bridge_ok "$result"
+}
+
+# Source: shared/code-clients.sh
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Thin code-mode clients for the common bridge.
+# Bump this when any client below changes.
+WPMCP_CODE_CLIENT_VERSION="2"
+
+wpmcp_code_require_runtime() {
+    local runtime="$1"
+
+    case "$runtime" in
+        php)
+            wpmcp_command_exists php || wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                "PHP is required for --runtime php."
+            if ! php -r 'exit(PHP_VERSION_ID >= 80000 ? 0 : 1);' >/dev/null 2>&1; then
+                wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                    "PHP >= 8.0 is required for --runtime php."
+            fi
+            if ! php -r 'exit(function_exists("proc_open") ? 0 : 1);' >/dev/null 2>&1; then
+                wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                    "PHP proc_open() is disabled; --runtime php requires it."
+            fi
+            ;;
+        python)
+            wpmcp_command_exists python3 || wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                "Python 3.8+ is required for --runtime python."
+            if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1; then
+                wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                    "Python 3.8+ is required for --runtime python."
+            fi
+            ;;
+        node)
+            wpmcp_command_exists node || wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                "Node.js 18+ is required for --runtime node."
+            if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 18 ? 0 : 1)' >/dev/null 2>&1; then
+                wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                    "Node.js 18+ is required for --runtime node."
+            fi
+            ;;
+        *)
+            wpmcp_error_usage "Unknown runtime: $runtime"
+            ;;
+    esac
+}
+
+wpmcp_code_validate_client() {
+    local runtime="$1"
+    local base="$2"
+
+    case "$runtime" in
+        php)
+            php -l "$base/php/wpmcp-code.php" >/dev/null 2>&1 || \
+                wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                    "The PHP code client failed syntax validation."
+            ;;
+        python)
+            if ! python3 - "$base/python/wpmcp_code.py" "$base/python/runner.py" <<'WPMCP_CODE_PY_CHECK'
+import sys
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as handle:
+        compile(handle.read(), path, "exec")
+WPMCP_CODE_PY_CHECK
+            then
+                wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                    "The Python code client failed syntax validation."
+            fi
+            ;;
+        node)
+            node --check "$base/node/wpmcp-code.cjs" >/dev/null 2>&1 || \
+                wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                    "The Node code client failed syntax validation."
+            ;;
+    esac
+}
+
+wpmcp_code_extract_clients() {
+    local runtime="$1"
+    local base="$WPMCP_HOME/lib/code"
+    local version_file="$base/version"
+    local php_file="$base/php/wpmcp-code.php"
+    local py_file="$base/python/wpmcp_code.py"
+    local py_runner="$base/python/runner.py"
+    local node_file="$base/node/wpmcp-code.cjs"
+
+    mkdir -p "$base/php" "$base/python" "$base/node" || \
+        wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+            "Cannot create $base."
+    chmod 700 "$base" "$base/php" "$base/python" "$base/node" 2>/dev/null || true
+
+    if [ -f "$version_file" ] &&
+        [ "$(cat "$version_file" 2>/dev/null)" = "$WPMCP_CODE_CLIENT_VERSION" ] &&
+        [ -f "$php_file" ] && [ -f "$py_file" ] && [ -f "$py_runner" ] && [ -f "$node_file" ]; then
+        wpmcp_code_validate_client "$runtime" "$base"
+        return 0
+    fi
+
+    local tmp
+
+    tmp="$php_file.tmp.$$"
+    cat > "$tmp" <<'WPMCP_CODE_PHP_CLIENT'
+<?php
+// wp-mcp code PHP client (AGPL-3.0-or-later)
+// Thin client: modes, budgets, annotations and logging live in the common bridge.
+
+if (defined('WPMCP_CODE_CLIENT')) {
     return;
 }
-define('WPMCP_CODE_BOOTSTRAP', '1');
+define('WPMCP_CODE_CLIENT', '2');
 
 final class WPMCP_Code_Error extends RuntimeException
 {
     public string $errorCode;
     public int $exitCode;
-    public ?int $httpStatus;
     public ?string $remoteCode;
     public array $details;
 
@@ -556,14 +1069,12 @@ final class WPMCP_Code_Error extends RuntimeException
         string $errorCode,
         string $message,
         int $exitCode = 5,
-        ?int $httpStatus = null,
         ?string $remoteCode = null,
         array $details = []
     ) {
         parent::__construct($message);
         $this->errorCode = $errorCode;
         $this->exitCode = $exitCode;
-        $this->httpStatus = $httpStatus;
         $this->remoteCode = $remoteCode;
         $this->details = $details;
     }
@@ -575,29 +1086,6 @@ function wp_mcp_code_env(string $key, string $default = ''): string
     return $value === false ? $default : $value;
 }
 
-function wp_mcp_code_started_at(): float
-{
-    return $GLOBALS['wpmcp_code_started_at'];
-}
-
-function wp_mcp_code_remaining(): int
-{
-    $timeout = (int) wp_mcp_code_env('WPMCP_CODE_TIMEOUT', '120');
-    $elapsed = microtime(true) - wp_mcp_code_started_at();
-    return max(1, $timeout - (int) floor($elapsed));
-}
-
-function wp_mcp_code_json_flags(): int
-{
-    return JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
-}
-
-function wp_mcp_code_json_bytes(mixed $value): int
-{
-    $json = json_encode($value, wp_mcp_code_json_flags());
-    return $json === false ? 0 : strlen($json);
-}
-
 function wp_mcp_code_log_event(string $type, array $data = []): void
 {
     $log = wp_mcp_code_env('WPMCP_CODE_LOG');
@@ -605,54 +1093,118 @@ function wp_mcp_code_log_event(string $type, array $data = []): void
         return;
     }
     $event = ['type' => $type] + $data;
-    $line = json_encode($event, wp_mcp_code_json_flags());
+    $line = json_encode($event, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
     if ($line === false) {
         return;
     }
     @file_put_contents($log, $line . "\n", FILE_APPEND | LOCK_EX);
 }
 
-function wp_mcp_code_next_seq(): int
+function wp_mcp_code_bridge(array $request): mixed
 {
-    return ++$GLOBALS['wpmcp_code_seq'];
-}
-
-function wp_mcp_code_count_call(): void
-{
-    $max = (int) wp_mcp_code_env('WPMCP_CODE_MAX_CALLS', '100');
-    $totalMax = max(50, $max * 3);
-    $GLOBALS['wpmcp_code_total_calls']++;
-    if ($GLOBALS['wpmcp_code_total_calls'] > $totalMax) {
-        throw new WPMCP_Code_Error(
-            'call_budget_exceeded',
-            "Total call budget exceeded (max $totalMax).",
-            5,
-            null,
-            null,
-            ['max_total_calls' => $totalMax]
-        );
+    $cli = wp_mcp_code_env('WPMCP_CODE_BRIDGE_CLI');
+    if ($cli === '' || !is_file($cli)) {
+        throw new WPMCP_Code_Error('internal_error', 'The wp-mcp CLI is missing.', 1);
     }
-}
 
-function wp_mcp_code_count_execution(): void
-{
-    $max = (int) wp_mcp_code_env('WPMCP_CODE_MAX_CALLS', '100');
-    $GLOBALS['wpmcp_code_executions']++;
-    if ($GLOBALS['wpmcp_code_executions'] > $max) {
-        throw new WPMCP_Code_Error(
-            'call_budget_exceeded',
-            "Call budget exceeded (max $max).",
-            5,
-            null,
-            null,
-            ['max_calls' => $max]
-        );
+    $out = tempnam(sys_get_temp_dir(), 'wpmcp-bridge-out-');
+    $err = tempnam(sys_get_temp_dir(), 'wpmcp-bridge-err-');
+    if ($out === false || $err === false) {
+        if (is_string($out)) {
+            @unlink($out);
+        }
+        if (is_string($err)) {
+            @unlink($err);
+        }
+        throw new WPMCP_Code_Error('internal_error', 'Could not create bridge temporary files.', 1);
     }
+    chmod($out, 0600);
+    chmod($err, 0600);
+
+    $cmd = is_executable($cli) ? [$cli, '__code-bridge'] : ['bash', $cli, '__code-bridge'];
+    $spec = [0 => ['pipe', 'r'], 1 => ['file', $out, 'w'], 2 => ['file', $err, 'w']];
+    $proc = proc_open($cmd, $spec, $pipes, null, null);
+    if (!is_resource($proc)) {
+        @unlink($out);
+        @unlink($err);
+        throw new WPMCP_Code_Error('internal_error', 'Could not start the code bridge.', 1);
+    }
+
+    $payload = json_encode($request, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+    if ($payload === false) {
+        fclose($pipes[0]);
+        @proc_terminate($proc);
+        @unlink($out);
+        @unlink($err);
+        throw new WPMCP_Code_Error('script_error', 'The bridge request is not JSON-encodable.', 5);
+    }
+    fwrite($pipes[0], $payload);
+    fclose($pipes[0]);
+    $exit = proc_close($proc);
+    $stdout = (string) file_get_contents($out);
+    $stderr = (string) file_get_contents($err);
+    @unlink($out);
+    @unlink($err);
+
+    $envelope = json_decode($stdout, true);
+    if ($exit === 0 && is_array($envelope) && ($envelope['ok'] ?? false) === true) {
+        return $envelope['data'] ?? null;
+    }
+
+    $decoded = json_decode($stderr, true);
+    $error = is_array($decoded) && isset($decoded['error']) && is_array($decoded['error'])
+        ? $decoded['error']
+        : null;
+    if ($error !== null) {
+        $code = (string) ($error['code'] ?? 'script_error');
+        $message = (string) ($error['message'] ?? 'The code bridge failed.');
+        $exitCode = isset($error['exitCode']) ? (int) $error['exitCode'] : ($exit > 0 ? $exit : 5);
+        $remote = isset($error['remoteCode']) && $error['remoteCode'] !== ''
+            ? (string) $error['remoteCode']
+            : null;
+        $details = isset($error['details']) && is_array($error['details']) ? $error['details'] : [];
+        throw new WPMCP_Code_Error($code, $message, $exitCode, $remote, $details);
+    }
+
+    throw new WPMCP_Code_Error(
+        'internal_error',
+        'The code bridge failed.',
+        $exit > 0 ? $exit : 1,
+        null,
+        ['stderr' => substr($stderr, -2000)]
+    );
 }
 
-function wp_mcp_code_valid_ability(string $ability): bool
+function wp_mcp_call(string $ability, mixed $input = null): mixed
 {
-    return preg_match('#^[a-z0-9-]+(?:/[a-z0-9-]+)+$#', $ability) === 1;
+    return wp_mcp_code_bridge(['op' => 'call', 'ability' => $ability, 'input' => $input]);
+}
+
+function wp_mcp_search(string $query, int $limit = 10, ?string $cursor = null): array
+{
+    $request = ['op' => 'search', 'query' => $query, 'limit' => max(1, min(50, $limit))];
+    if ($cursor !== null && $cursor !== '') {
+        $request['cursor'] = $cursor;
+    }
+    $rows = wp_mcp_code_bridge($request);
+    return is_array($rows) ? $rows : [];
+}
+
+function wp_mcp_discover(array $options = []): array
+{
+    $result = wp_mcp_code_bridge(['op' => 'discover', 'options' => $options]);
+    return is_array($result) ? $result : [];
+}
+
+function wp_mcp_describe(string $ability): array
+{
+    $result = wp_mcp_code_bridge(['op' => 'describe', 'ability' => $ability]);
+    return is_array($result) ? $result : [];
+}
+
+function wp_mcp_log(string $message): void
+{
+    wp_mcp_code_bridge(['op' => 'log', 'message' => $message]);
 }
 
 function wp_mcp_is_dry_run(): bool
@@ -674,397 +1226,7 @@ function wp_mcp_site(): array
     ];
 }
 
-function wp_mcp_log(string $message): void
-{
-    wp_mcp_code_log_event('log', ['message' => $message]);
-}
-
-function wp_mcp_code_write_all($stream, string $data): void
-{
-    $length = strlen($data);
-    $offset = 0;
-    while ($offset < $length) {
-        $written = @fwrite($stream, substr($data, $offset));
-        if ($written === false || $written === 0) {
-            throw new WPMCP_Code_Error('internal_error', 'Failed to write to the wp-mcp child process.', 1);
-        }
-        $offset += $written;
-    }
-}
-
-function wp_mcp_code_execute(string $ability, mixed $input): array
-{
-    $cli = wp_mcp_code_env('WPMCP_CODE_CLI');
-    if ($cli === '' || !is_file($cli)) {
-        throw new WPMCP_Code_Error('internal_error', 'The wp-mcp CLI path is missing.', 1);
-    }
-
-    // Keep child temp files inside the CLI's work directory so the cleanup
-    // trap removes them even if this PHP process is killed.
-    $workDir = dirname(wp_mcp_code_env('WPMCP_CODE_LOG'));
-    if ($workDir === '' || $workDir === '.') {
-        $workDir = sys_get_temp_dir();
-    }
-    $out = tempnam($workDir, 'child-out-');
-    $err = tempnam($workDir, 'child-err-');
-    if ($out === false || $err === false) {
-        if (is_string($out)) {
-            @unlink($out);
-        }
-        if (is_string($err)) {
-            @unlink($err);
-        }
-        throw new WPMCP_Code_Error('internal_error', 'Could not create temporary files.', 1);
-    }
-    chmod($out, 0600);
-    chmod($err, 0600);
-
-    $remaining = wp_mcp_code_remaining();
-    $httpTimeout = (int) wp_mcp_code_env('WPMCP_HTTP_TIMEOUT', '30');
-    if ($httpTimeout < 1) {
-        $httpTimeout = 30;
-    }
-    $env = [
-        'PATH' => wp_mcp_code_env('PATH'),
-        'HOME' => wp_mcp_code_env('HOME'),
-        'WPMCP_HOME' => wp_mcp_code_env('WPMCP_HOME'),
-        'WPMCP_SITE' => wp_mcp_code_env('WPMCP_CODE_SITE'),
-        'WPMCP_REST_PLAIN' => wp_mcp_code_env('WPMCP_REST_PLAIN', '0'),
-        'WPMCP_HTTP_TIMEOUT' => (string) max(1, min($httpTimeout, 30, $remaining)),
-        'WPMCP_QUIET' => '0',
-    ];
-    foreach ([
-        'TMPDIR', 'LANG', 'LC_ALL', 'TZ',
-        'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
-        'http_proxy', 'https_proxy', 'no_proxy',
-        'SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE',
-    ] as $key) {
-        $value = getenv($key);
-        if ($value !== false && $value !== '') {
-            $env[$key] = $value;
-        }
-    }
-    // Child temp bodies and logs stay inside the work directory so the CLI
-    // cleanup removes them even after a kill.
-    $env['TMPDIR'] = $workDir;
-
-    $cmd = is_executable($cli)
-        ? [$cli, '--json', 'run', $ability, '--input', '-']
-        : ['bash', $cli, '--json', 'run', $ability, '--input', '-'];
-    $spec = [
-        0 => ['pipe', 'r'],
-        1 => ['file', $out, 'w'],
-        2 => ['file', $err, 'w'],
-    ];
-    $proc = proc_open($cmd, $spec, $pipes, null, $env);
-    if (!is_resource($proc)) {
-        @unlink($out);
-        @unlink($err);
-        throw new WPMCP_Code_Error('internal_error', 'Could not start the wp-mcp child process.', 1);
-    }
-
-    try {
-        $payload = json_encode($input, wp_mcp_code_json_flags());
-        if ($payload === false) {
-            throw new WPMCP_Code_Error('script_error', 'The ability input is not JSON-encodable.', 5);
-        }
-        wp_mcp_code_write_all($pipes[0], $payload);
-        fclose($pipes[0]);
-        $exit = proc_close($proc);
-    } catch (Throwable $e) {
-        if (isset($pipes[0]) && is_resource($pipes[0])) {
-            fclose($pipes[0]);
-        }
-        @proc_terminate($proc);
-        @unlink($out);
-        @unlink($err);
-        throw $e;
-    }
-
-    $stdout = (string) file_get_contents($out);
-    $stderr = (string) file_get_contents($err);
-    @unlink($out);
-    @unlink($err);
-
-    $envelope = json_decode($stdout, true);
-    if ($exit === 0 && is_array($envelope) && ($envelope['ok'] ?? false) === true) {
-        $status = isset($envelope['meta']['http_status']) ? (int) $envelope['meta']['http_status'] : 200;
-        return ['data' => $envelope['data'] ?? null, 'http_status' => $status];
-    }
-
-    $error = null;
-    $decoded = json_decode($stderr, true);
-    if (is_array($decoded) && isset($decoded['error']) && is_array($decoded['error'])) {
-        $error = $decoded['error'];
-    }
-
-    $code = is_array($error) ? (string) ($error['code'] ?? 'script_error') : 'script_error';
-    $message = is_array($error)
-        ? (string) ($error['message'] ?? 'The wp-mcp child process failed.')
-        : 'The wp-mcp child process failed.';
-    $remote = is_array($error) && isset($error['remoteCode']) && $error['remoteCode'] !== ''
-        ? (string) $error['remoteCode']
-        : null;
-    $details = is_array($error) && isset($error['details']) && is_array($error['details'])
-        ? $error['details']
-        : [];
-    if ($remote === null && str_starts_with($code, 'wp_mcp_')) {
-        $remote = $code;
-    }
-
-    $map = [
-        'wp_mcp_ability_not_found' => ['ability_not_found', 2],
-        'wp_mcp_ability_hidden' => ['ability_not_found', 2],
-        'wp_mcp_invalid_input' => ['schema_validation_failed', 5],
-        'wp_mcp_missing_field' => ['schema_validation_failed', 5],
-        'wp_mcp_forbidden' => ['auth_denied', 3],
-        'wp_mcp_disabled' => ['auth_denied', 3],
-    ];
-    $exitCode = $exit > 0 ? $exit : 5;
-    if (isset($map[$code])) {
-        [$code, $exitCode] = $map[$code];
-    }
-
-    if (!is_array($error)) {
-        $details['stderr'] = substr($stderr, -2000);
-    }
-
-    throw new WPMCP_Code_Error($code, $message, $exitCode, null, $remote, $details);
-}
-
-function wp_mcp_code_execute_logged(
-    string $ability,
-    mixed $input,
-    string $kind,
-    ?int $seq = null,
-    ?bool $readonly = null,
-    ?bool $destructive = null
-): mixed {
-    $seq = $seq ?? wp_mcp_code_next_seq();
-    $start = microtime(true);
-    $bytes = wp_mcp_code_json_bytes($input);
-    wp_mcp_code_log_event('call_start', [
-        'seq' => $seq,
-        'ability' => $ability,
-        'kind' => $kind,
-        'readonly' => $readonly,
-        'destructive' => $destructive,
-        'request_bytes' => $bytes,
-    ]);
-
-    try {
-        $result = wp_mcp_code_execute($ability, $input);
-        wp_mcp_code_log_event('call_end', [
-            'seq' => $seq,
-            'ability' => $ability,
-            'kind' => $kind,
-            'status' => 'ok',
-            'http_status' => $result['http_status'],
-            'duration_ms' => (int) round((microtime(true) - $start) * 1000),
-            'request_bytes' => $bytes,
-            'response_bytes' => wp_mcp_code_json_bytes($result['data']),
-            'error_code' => null,
-            'readonly' => $readonly,
-            'destructive' => $destructive,
-        ]);
-        return $result['data'];
-    } catch (WPMCP_Code_Error $e) {
-        wp_mcp_code_log_event('call_end', [
-            'seq' => $seq,
-            'ability' => $ability,
-            'kind' => $kind,
-            'status' => 'error',
-            'http_status' => $e->httpStatus,
-            'duration_ms' => (int) round((microtime(true) - $start) * 1000),
-            'request_bytes' => $bytes,
-            'response_bytes' => 0,
-            'error_code' => $e->errorCode,
-            'readonly' => $readonly,
-            'destructive' => $destructive,
-        ]);
-        throw $e;
-    }
-}
-
-function wp_mcp_code_log_stub(
-    int $seq,
-    string $ability,
-    string $status,
-    bool $readonly,
-    bool $destructive,
-    mixed $input
-): void {
-    $bytes = wp_mcp_code_json_bytes($input);
-    wp_mcp_code_log_event('call_start', [
-        'seq' => $seq,
-        'ability' => $ability,
-        'kind' => 'call',
-        'readonly' => $readonly,
-        'destructive' => $destructive,
-        'request_bytes' => $bytes,
-    ]);
-    wp_mcp_code_log_event('call_end', [
-        'seq' => $seq,
-        'ability' => $ability,
-        'kind' => 'call',
-        'status' => $status,
-        'http_status' => null,
-        'duration_ms' => 0,
-        'request_bytes' => $bytes,
-        'response_bytes' => 0,
-        'error_code' => null,
-        'readonly' => $readonly,
-        'destructive' => $destructive,
-    ]);
-}
-
-function wp_mcp_code_annotations(string $ability): array
-{
-    if (isset($GLOBALS['wpmcp_code_definitions'][$ability])) {
-        return $GLOBALS['wpmcp_code_definitions'][$ability]['meta']['annotations'] ?? [];
-    }
-    if (isset($GLOBALS['wpmcp_code_annotations'][$ability])) {
-        return $GLOBALS['wpmcp_code_annotations'][$ability];
-    }
-    $definition = wp_mcp_describe($ability);
-    return $definition['meta']['annotations'] ?? [];
-}
-
-function wp_mcp_code_cache_annotations(array $rows): void
-{
-    foreach ($rows as $row) {
-        if (!is_array($row) || !isset($row['name']) || !is_string($row['name'])) {
-            continue;
-        }
-        if (array_key_exists('readonly', $row) || array_key_exists('destructive', $row)) {
-            $GLOBALS['wpmcp_code_annotations'][$row['name']] = [
-                'readonly' => ($row['readonly'] ?? false) === true,
-                // Fail closed when the discovery row does not say.
-                'destructive' => array_key_exists('destructive', $row)
-                    ? (bool) $row['destructive']
-                    : true,
-            ];
-        }
-    }
-}
-
-function wp_mcp_discover(array $options = []): array
-{
-    wp_mcp_code_count_call();
-    $result = wp_mcp_code_execute_logged(
-        'mcp-adapter/discover-abilities',
-        $options,
-        'search',
-        null,
-        true,
-        false
-    );
-    if (!is_array($result)) {
-        throw new WPMCP_Code_Error('script_error', 'The discovery result was not an object.', 5);
-    }
-    wp_mcp_code_cache_annotations($result['abilities'] ?? []);
-    return $result;
-}
-
-function wp_mcp_search(string $query, int $limit = 10, ?string $cursor = null): array
-{
-    $limit = max(1, min(50, $limit));
-    $key = md5(json_encode([$query, $limit, $cursor], wp_mcp_code_json_flags()) ?: '');
-    if (isset($GLOBALS['wpmcp_code_search_cache'][$key])) {
-        return $GLOBALS['wpmcp_code_search_cache'][$key];
-    }
-    $options = ['query' => $query, 'limit' => $limit];
-    if ($cursor !== null && $cursor !== '') {
-        $options['cursor'] = $cursor;
-    }
-    $result = wp_mcp_discover($options);
-    $rows = is_array($result['abilities'] ?? null) ? $result['abilities'] : [];
-    $GLOBALS['wpmcp_code_search_cache'][$key] = $rows;
-    return $rows;
-}
-
-function wp_mcp_describe(string $ability): array
-{
-    if (isset($GLOBALS['wpmcp_code_definitions'][$ability])) {
-        return $GLOBALS['wpmcp_code_definitions'][$ability];
-    }
-    wp_mcp_code_count_call();
-    $definition = wp_mcp_code_execute_logged(
-        'wp-mcp/get-ability-info',
-        ['ability_name' => $ability, 'detail' => 'full'],
-        'describe',
-        null,
-        true,
-        false
-    );
-    if (!is_array($definition)) {
-        throw new WPMCP_Code_Error('script_error', 'The ability definition was not an object.', 5);
-    }
-    $GLOBALS['wpmcp_code_definitions'][$ability] = $definition;
-    $annotations = $definition['meta']['annotations'] ?? null;
-    if (is_array($annotations)) {
-        $GLOBALS['wpmcp_code_annotations'][$ability] = $annotations;
-    }
-    return $definition;
-}
-
-function wp_mcp_call(string $ability, mixed $input = null): mixed
-{
-    if (!wp_mcp_code_valid_ability($ability)) {
-        throw new WPMCP_Code_Error(
-            'usage_error',
-            "Invalid ability name: $ability",
-            2,
-            null,
-            null,
-            ['ability' => $ability]
-        );
-    }
-
-    wp_mcp_code_count_call();
-    wp_mcp_code_count_execution();
-
-    $annotations = wp_mcp_code_annotations($ability);
-    $readonly = ($annotations['readonly'] ?? false) === true;
-    $destructive = array_key_exists('destructive', $annotations)
-        ? (bool) $annotations['destructive']
-        : true;
-
-    $seq = wp_mcp_code_next_seq();
-
-    if (wp_mcp_is_dry_run()) {
-        wp_mcp_code_log_stub($seq, $ability, 'dry_run', $readonly, $destructive, $input);
-        return ['__wp_mcp_dry_run' => true, 'ability' => $ability, 'input' => $input];
-    }
-
-    if (wp_mcp_is_read_only() && !$readonly) {
-        wp_mcp_code_log_stub($seq, $ability, 'skipped', $readonly, $destructive, $input);
-        return ['__wp_mcp_skipped' => true, 'ability' => $ability, 'reason' => 'not_readonly'];
-    }
-
-    if ($destructive && wp_mcp_code_env('WPMCP_CODE_ALLOW_DESTRUCTIVE') !== '1') {
-        wp_mcp_code_log_stub($seq, $ability, 'blocked', $readonly, $destructive, $input);
-        throw new WPMCP_Code_Error(
-            'confirmation_required',
-            "Ability '$ability' is destructive. Re-run with --yes.",
-            6,
-            null,
-            null,
-            ['ability' => $ability, 'seq' => $seq]
-        );
-    }
-
-    return wp_mcp_code_execute_logged($ability, $input, 'call', $seq, $readonly, $destructive);
-}
-
 $GLOBALS['wpmcp_code_started_at'] = microtime(true);
-$GLOBALS['wpmcp_code_seq'] = 0;
-$GLOBALS['wpmcp_code_executions'] = 0;
-$GLOBALS['wpmcp_code_total_calls'] = 0;
-$GLOBALS['wpmcp_code_definitions'] = [];
-$GLOBALS['wpmcp_code_annotations'] = [];
-$GLOBALS['wpmcp_code_search_cache'] = [];
-
 $wpmcp_code_log = wp_mcp_code_env('WPMCP_CODE_LOG');
 if ($wpmcp_code_log === '' || !is_file($wpmcp_code_log) || !is_writable($wpmcp_code_log)) {
     fwrite(STDERR, "wp-mcp code: the call log is not writable.\n");
@@ -1109,18 +1271,492 @@ register_shutdown_function(static function (): void {
         'memory_peak' => memory_get_peak_usage(true),
     ]);
 });
-WPMCP_CODE_BOOTSTRAP
-
+WPMCP_CODE_PHP_CLIENT
     chmod 600 "$tmp"
-    if ! php -l "$tmp" >/dev/null 2>&1; then
-        rm -f "$tmp"
-        wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
-            "The bundled PHP bootstrap failed syntax validation."
-    fi
-    mv -f "$tmp" "$target"
-    printf '%s\n' "$WPMCP_CODE_BOOTSTRAP_VERSION" > "$version_file"
-    chmod 600 "$version_file"
+    mv -f "$tmp" "$php_file"
+
+    tmp="$py_file.tmp.$$"
+    cat > "$tmp" <<'WPMCP_CODE_PYTHON_CLIENT'
+"""Thin client for wp-mcp code mode.
+
+Modes, budgets, annotations and logging live in the common bridge.
+"""
+import atexit
+import builtins
+import json
+import os
+import subprocess
+import sys
+import time
+
+_STARTED = time.time()
+_INSTALLED = False
+
+
+class WPMCPCodeError(Exception):
+    def __init__(self, error_code, message, exit_code=5, remote_code=None, details=None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.exit_code = int(exit_code)
+        self.remote_code = remote_code
+        self.details = details or {}
+
+
+def _env(key, default=""):
+    value = os.environ.get(key)
+    return default if value is None else value
+
+
+def _encode(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _log_event(kind, data):
+    path = _env("WPMCP_CODE_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(_encode({"type": kind, **data}) + "\n")
+    except OSError:
+        pass
+
+
+def _error_from(envelope, fallback_exit):
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    if not isinstance(error, dict):
+        return None
+    return WPMCPCodeError(
+        error.get("code", "script_error"),
+        error.get("message", "The code bridge failed."),
+        error.get("exitCode", fallback_exit or 5),
+        error.get("remoteCode") or None,
+        error.get("details") or {},
+    )
+
+
+def _bridge(request):
+    cli = _env("WPMCP_CODE_BRIDGE_CLI")
+    if not cli or not os.path.isfile(cli):
+        raise WPMCPCodeError("internal_error", "The wp-mcp CLI is missing.", 1)
+
+    command = [cli, "__code-bridge"] if os.access(cli, os.X_OK) else ["bash", cli, "__code-bridge"]
+    try:
+        result = subprocess.run(
+            command,
+            input=_encode(request).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=os.environ,
+        )
+    except OSError as exc:
+        raise WPMCPCodeError("internal_error", "Could not start the code bridge: %s" % exc, 1)
+
+    stdout = result.stdout.decode("utf-8", "replace")
+    stderr = result.stderr.decode("utf-8", "replace")
+
+    if result.returncode == 0:
+        try:
+            envelope = json.loads(stdout)
+        except json.JSONDecodeError:
+            raise WPMCPCodeError(
+                "internal_error",
+                "The code bridge returned invalid JSON.",
+                1,
+                None,
+                {"stderr": stderr[-2000:]},
+            )
+        if isinstance(envelope, dict) and envelope.get("ok") is True:
+            return envelope.get("data")
+        error = _error_from(envelope, result.returncode)
+        if error is not None:
+            raise error
+        raise WPMCPCodeError(
+            "internal_error",
+            "The code bridge returned an unexpected envelope.",
+            1,
+            None,
+            {"stderr": stderr[-2000:]},
+        )
+
+    try:
+        envelope = json.loads(stderr)
+    except json.JSONDecodeError:
+        envelope = None
+    error = _error_from(envelope, result.returncode)
+    if error is not None:
+        raise error
+    raise WPMCPCodeError(
+        "internal_error",
+        "The code bridge failed.",
+        result.returncode or 1,
+        None,
+        {"stderr": stderr[-2000:]},
+    )
+
+
+def wp_mcp_call(ability, input=None):
+    return _bridge({"op": "call", "ability": ability, "input": input})
+
+
+def wp_mcp_search(query, limit=10, cursor=None):
+    request = {"op": "search", "query": query, "limit": max(1, min(50, int(limit)))}
+    if cursor:
+        request["cursor"] = cursor
+    rows = _bridge(request)
+    return rows if isinstance(rows, list) else []
+
+
+def wp_mcp_discover(options=None):
+    result = _bridge({"op": "discover", "options": options or {}})
+    return result if isinstance(result, dict) else {}
+
+
+def wp_mcp_describe(ability):
+    result = _bridge({"op": "describe", "ability": ability})
+    return result if isinstance(result, dict) else {}
+
+
+def wp_mcp_log(message):
+    _bridge({"op": "log", "message": str(message)})
+
+
+def wp_mcp_is_dry_run():
+    return _env("WPMCP_CODE_DRY_RUN") == "1"
+
+
+def wp_mcp_is_read_only():
+    return _env("WPMCP_CODE_READ_ONLY") == "1"
+
+
+def wp_mcp_site():
+    return {
+        "name": _env("WPMCP_CODE_SITE"),
+        "url": _env("WPMCP_CODE_SITE_URL"),
+        "origin": _env("WPMCP_CODE_ORIGIN"),
+    }
+
+
+def _excepthook(exc_type, exc, traceback):
+    if isinstance(exc, SystemExit):
+        sys.__excepthook__(exc_type, exc, traceback)
+        return
+    code = getattr(exc, "error_code", "script_error")
+    exit_code = getattr(exc, "exit_code", 5)
+    remote = getattr(exc, "remote_code", None)
+    details = getattr(exc, "details", {})
+    _log_event("error", {
+        "code": code,
+        "message": str(exc),
+        "exit_code": exit_code,
+        "remote_code": remote,
+        "details": details,
+    })
+    sys.stderr.write(str(exc) + "\n")
+    sys.exit(exit_code)
+
+
+def _atexit():
+    _log_event("end", {"duration_ms": int((time.time() - _STARTED) * 1000)})
+
+
+def install():
+    global _INSTALLED
+    if _INSTALLED:
+        return
+    _INSTALLED = True
+    exports = [
+        "wp_mcp_call",
+        "wp_mcp_search",
+        "wp_mcp_discover",
+        "wp_mcp_describe",
+        "wp_mcp_log",
+        "wp_mcp_is_dry_run",
+        "wp_mcp_is_read_only",
+        "wp_mcp_site",
+        "WPMCPCodeError",
+    ]
+    for name in exports:
+        setattr(builtins, name, globals()[name])
+    sys.excepthook = _excepthook
+    atexit.register(_atexit)
+    _log_event("start", {"started_at": _STARTED, "pid": os.getpid()})
+WPMCP_CODE_PYTHON_CLIENT
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$py_file"
+
+    tmp="$py_runner.tmp.$$"
+    cat > "$tmp" <<'WPMCP_CODE_PYTHON_RUNNER'
+import os
+import runpy
+import sys
+
+import wpmcp_code
+
+wpmcp_code.install()
+script = os.environ["WPMCP_CODE_SCRIPT"]
+sys.argv = [script]
+sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
+runpy.run_path(script, run_name="__main__")
+WPMCP_CODE_PYTHON_RUNNER
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$py_runner"
+
+    tmp="$node_file.tmp.$$"
+    cat > "$tmp" <<'WPMCP_CODE_NODE_CLIENT'
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+
+const STARTED = Date.now();
+
+class WPMCPCodeError extends Error {
+    constructor(errorCode, message, exitCode = 5, remoteCode = null, details = {}) {
+        super(message);
+        this.name = "WPMCPCodeError";
+        this.errorCode = errorCode;
+        this.exitCode = Number.isInteger(exitCode) ? exitCode : 5;
+        this.remoteCode = remoteCode;
+        this.details = details;
+    }
 }
+
+function _env(key, fallback = "") {
+    const value = process.env[key];
+    return value === undefined ? fallback : value;
+}
+
+function _logEvent(type, data) {
+    const log = _env("WPMCP_CODE_LOG");
+    if (!log) {
+        return;
+    }
+    try {
+        fs.appendFileSync(log, JSON.stringify({ type, ...data }) + "\n");
+    } catch {
+        // logging must not break the script
+    }
+}
+
+function _errorFrom(error, fallbackExit) {
+    if (!error || typeof error !== "object") {
+        return null;
+    }
+    return new WPMCPCodeError(
+        error.code || "script_error",
+        error.message || "The code bridge failed.",
+        Number.isInteger(error.exitCode) ? error.exitCode : (fallbackExit || 5),
+        error.remoteCode || null,
+        error.details || {}
+    );
+}
+
+function _bridge(request) {
+    const cli = _env("WPMCP_CODE_BRIDGE_CLI");
+    if (!cli || !fs.existsSync(cli)) {
+        throw new WPMCPCodeError("internal_error", "The wp-mcp CLI is missing.", 1);
+    }
+
+    let command = cli;
+    let args = ["__code-bridge"];
+    try {
+        fs.accessSync(cli, fs.constants.X_OK);
+    } catch {
+        command = "bash";
+        args = [cli, "__code-bridge"];
+    }
+
+    const result = spawnSync(command, args, {
+        input: JSON.stringify(request),
+        encoding: "utf8",
+        env: process.env,
+        maxBuffer: 64 * 1024 * 1024,
+    });
+    if (result.error) {
+        throw new WPMCPCodeError("internal_error", `Could not start the code bridge: ${result.error.message}`, 1);
+    }
+
+    const stdout = result.stdout || "";
+    const stderr = result.stderr || "";
+
+    if (result.status === 0) {
+        let envelope;
+        try {
+            envelope = JSON.parse(stdout);
+        } catch {
+            throw new WPMCPCodeError(
+                "internal_error",
+                "The code bridge returned invalid JSON.",
+                1,
+                null,
+                { stderr: stderr.slice(-2000) }
+            );
+        }
+        if (envelope && envelope.ok === true) {
+            return envelope.data;
+        }
+        const error = _errorFrom(envelope && envelope.error, result.status);
+        if (error) {
+            throw error;
+        }
+        throw new WPMCPCodeError(
+            "internal_error",
+            "The code bridge returned an unexpected envelope.",
+            1,
+            null,
+            { stderr: stderr.slice(-2000) }
+        );
+    }
+
+    let envelope = null;
+    try {
+        envelope = JSON.parse(stderr);
+    } catch {
+        envelope = null;
+    }
+    const error = _errorFrom(envelope && envelope.error, result.status);
+    if (error) {
+        throw error;
+    }
+    throw new WPMCPCodeError(
+        "internal_error",
+        "The code bridge failed.",
+        result.status || 1,
+        null,
+        { stderr: stderr.slice(-2000) }
+    );
+}
+
+function wp_mcp_call(ability, input = null) {
+    return _bridge({ op: "call", ability, input });
+}
+
+function wp_mcp_search(query, limit = 10, cursor = null) {
+    const request = { op: "search", query, limit: Math.max(1, Math.min(50, Number(limit))) };
+    if (cursor) {
+        request.cursor = cursor;
+    }
+    const rows = _bridge(request);
+    return Array.isArray(rows) ? rows : [];
+}
+
+function wp_mcp_discover(options = {}) {
+    const result = _bridge({ op: "discover", options: options || {} });
+    return result && typeof result === "object" ? result : {};
+}
+
+function wp_mcp_describe(ability) {
+    const result = _bridge({ op: "describe", ability });
+    return result && typeof result === "object" ? result : {};
+}
+
+function wp_mcp_log(message) {
+    _bridge({ op: "log", message: String(message) });
+}
+
+function wp_mcp_is_dry_run() {
+    return _env("WPMCP_CODE_DRY_RUN") === "1";
+}
+
+function wp_mcp_is_read_only() {
+    return _env("WPMCP_CODE_READ_ONLY") === "1";
+}
+
+function wp_mcp_site() {
+    return {
+        name: _env("WPMCP_CODE_SITE"),
+        url: _env("WPMCP_CODE_SITE_URL"),
+        origin: _env("WPMCP_CODE_ORIGIN"),
+    };
+}
+
+function _fail(error) {
+    const code = error instanceof WPMCPCodeError ? error.errorCode : "script_error";
+    const exitCode = error instanceof WPMCPCodeError ? error.exitCode : 5;
+    _logEvent("error", {
+        code,
+        message: error && error.message ? error.message : String(error),
+        exit_code: exitCode,
+        remote_code: error && error.remoteCode ? error.remoteCode : null,
+        details: error && error.details ? error.details : {},
+    });
+    process.stderr.write((error && error.message ? error.message : String(error)) + "\n");
+    process.exit(exitCode);
+}
+
+process.on("uncaughtException", _fail);
+process.on("unhandledRejection", _fail);
+process.on("exit", () => _logEvent("end", { duration_ms: Date.now() - STARTED }));
+_logEvent("start", { started_at: STARTED / 1000, pid: process.pid });
+
+globalThis.WPMCPCodeError = WPMCPCodeError;
+globalThis.wp_mcp_call = wp_mcp_call;
+globalThis.wp_mcp_search = wp_mcp_search;
+globalThis.wp_mcp_discover = wp_mcp_discover;
+globalThis.wp_mcp_describe = wp_mcp_describe;
+globalThis.wp_mcp_log = wp_mcp_log;
+globalThis.wp_mcp_is_dry_run = wp_mcp_is_dry_run;
+globalThis.wp_mcp_is_read_only = wp_mcp_is_read_only;
+globalThis.wp_mcp_site = wp_mcp_site;
+WPMCP_CODE_NODE_CLIENT
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$node_file"
+
+    printf '%s\n' "$WPMCP_CODE_CLIENT_VERSION" > "$version_file"
+    chmod 600 "$version_file"
+    rm -f "$WPMCP_HOME/lib/code-bootstrap.php" "$WPMCP_HOME/lib/code-bootstrap.version"
+
+    wpmcp_code_validate_client "$runtime" "$base"
+}
+
+# Source: shared/code.sh
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Code mode helpers: PHP bootstrap extraction, execution and rendering.
+# The user script runs locally. It is not a sandbox.
+
+# Bump this whenever the embedded PHP bootstrap changes so existing
+# installations rewrite $WPMCP_HOME/lib/code-bootstrap.php.
+WPMCP_CODE_OUTPUT_LIMIT=1048576
+WPMCP_CODE_WORK_DIR=""
+WPMCP_CODE_PHP_PID=""
+WPMCP_CODE_WATCHDOG_PID=""
+
+wpmcp_code_cleanup() {
+    if [ -n "${WPMCP_CODE_PHP_PID:-}" ] && kill -0 "$WPMCP_CODE_PHP_PID" 2>/dev/null; then
+        kill -TERM -- "-$WPMCP_CODE_PHP_PID" 2>/dev/null || kill "$WPMCP_CODE_PHP_PID" 2>/dev/null || true
+    fi
+    if [ -n "${WPMCP_CODE_WATCHDOG_PID:-}" ] && kill -0 "$WPMCP_CODE_WATCHDOG_PID" 2>/dev/null; then
+        kill -TERM -- "-$WPMCP_CODE_WATCHDOG_PID" 2>/dev/null || kill "$WPMCP_CODE_WATCHDOG_PID" 2>/dev/null || true
+    fi
+    if [ -n "${WPMCP_CODE_WORK_DIR:-}" ]; then
+        rm -rf "$WPMCP_CODE_WORK_DIR"
+    fi
+}
+
+
+wpmcp_code_cli_path() {
+    local cli="${BASH_SOURCE[0]:-$0}"
+    case "$cli" in
+        /*) printf '%s' "$cli" ;;
+        *) printf '%s/%s' "$(cd "$(dirname "$cli")" && pwd)" "$(basename "$cli")" ;;
+    esac
+}
+
+wpmcp_code_sha256() {
+    local file="$1"
+    if wpmcp_command_exists sha256sum; then
+        sha256sum "$file" | awk '{print $1}'
+    elif wpmcp_command_exists shasum; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    else
+        wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+            "No SHA-256 tool is available."
+    fi
+}
+
 
 wpmcp_code_ensure_newline() {
     # Keep the human summary/error from running into script output that does
@@ -1144,24 +1780,42 @@ wpmcp_code_read_log() {
     jq -Rsc 'split("\n") | map(select(length > 0) | (fromjson? // empty))' "$log" 2>/dev/null || printf '[]'
 }
 
-wpmcp_code_run_php() {
-    # wpmcp_code_run_php <script> <bootstrap> <out> <err> <timeout> <timeout_flag>
-    local script="$1"
-    local bootstrap="$2"
-    local out="$3"
-    local err="$4"
-    local timeout="$5"
-    local timeout_flag="$6"
+
+wpmcp_code_run_runtime() {
+    # wpmcp_code_run_runtime <runtime> <script> <client_dir> <out> <err> <timeout> <timeout_flag>
+    local runtime="$1"
+    local script="$2"
+    local client_dir="$3"
+    local out="$4"
+    local err="$5"
+    local timeout="$6"
+    local timeout_flag="$7"
     local status=0
 
     set -m
-    php -d auto_prepend_file="$bootstrap" \
-        -d max_execution_time="$timeout" \
-        -d display_errors=stderr \
-        -d html_errors=0 \
-        -d log_errors=0 \
-        -d memory_limit=256M \
-        "$script" >"$out" 2>"$err" &
+    case "$runtime" in
+        php)
+            php -d auto_prepend_file="$client_dir/php/wpmcp-code.php" \
+                -d max_execution_time="$timeout" \
+                -d display_errors=stderr \
+                -d html_errors=0 \
+                -d log_errors=0 \
+                -d memory_limit=256M \
+                "$script" >"$out" 2>"$err" &
+            ;;
+        python)
+            PYTHONPATH="$client_dir/python${PYTHONPATH:+:$PYTHONPATH}" \
+                WPMCP_CODE_SCRIPT="$script" \
+                python3 "$client_dir/python/runner.py" >"$out" 2>"$err" &
+            ;;
+        node)
+            node --require "$client_dir/node/wpmcp-code.cjs" "$script" >"$out" 2>"$err" &
+            ;;
+        *)
+            set +m
+            wpmcp_error_usage "Unknown runtime: $runtime"
+            ;;
+    esac
     local pid=$!
     WPMCP_CODE_PHP_PID="$pid"
 
@@ -1176,9 +1830,6 @@ wpmcp_code_run_php() {
     ) &
     local watchdog=$!
     WPMCP_CODE_WATCHDOG_PID="$watchdog"
-    # The processes already have their own process groups. Disable monitor
-    # mode before they exit so Bash does not print job-control notices to
-    # the CLI's stderr (which must stay clean for the JSON error envelope).
     set +m
 
     wait "$pid" || status=$?
@@ -2342,6 +2993,8 @@ wpmcp_code() {
     local max_calls=100
     local timeout=120
     local verbose=0
+    local runtime=""
+    local allow_list=()
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -2381,6 +3034,28 @@ wpmcp_code() {
                 ;;
             --verbose)
                 verbose=1
+                shift
+                ;;
+            --runtime)
+                if [ "$#" -lt 2 ]; then
+                    wpmcp_error_usage "--runtime requires a value"
+                fi
+                runtime="$2"
+                shift 2
+                ;;
+            --runtime=*)
+                runtime="${1#--runtime=}"
+                shift
+                ;;
+            --allow)
+                if [ "$#" -lt 2 ]; then
+                    wpmcp_error_usage "--allow requires an ability name"
+                fi
+                allow_list+=("$2")
+                shift 2
+                ;;
+            --allow=*)
+                allow_list+=("${1#--allow=}")
                 shift
                 ;;
             --help|-h)
@@ -2446,6 +3121,29 @@ wpmcp_code() {
     if [ "$yes" = "1" ] && { [ "$dry_run" = "1" ] || [ "$read_only" = "1" ]; }; then
         wpmcp_error_usage "--yes cannot be combined with --dry-run or --read-only"
     fi
+    if [ "$yes" = "1" ] && [ "${#allow_list[@]}" -gt 0 ]; then
+        wpmcp_error_usage "--yes and --allow are mutually exclusive"
+    fi
+
+    local allowed
+    for allowed in "${allow_list[@]}"; do
+        if ! [[ "$allowed" =~ ^[a-z0-9-]+(/[a-z0-9-]+)+$ ]]; then
+            wpmcp_error_usage "Invalid --allow ability: $allowed"
+        fi
+    done
+
+    if [ -z "$runtime" ]; then
+        case "$script" in
+            *.php) runtime="php" ;;
+            *.py) runtime="python" ;;
+            *.js|*.mjs|*.cjs) runtime="node" ;;
+            *) runtime="php" ;;
+        esac
+    fi
+    case "$runtime" in
+        php|python|node) ;;
+        *) wpmcp_error_usage "Unknown runtime: $runtime" ;;
+    esac
 
     wpmcp_paths_init
     wpmcp_config_resolve_site
@@ -2460,10 +3158,9 @@ wpmcp_code() {
             "Active site has no siteUrl: $WPMCP_ACTIVE_SITE"
     fi
 
-    wpmcp_code_require_php
-    wpmcp_code_extract_bootstrap
-    local bootstrap
-    bootstrap=$(wpmcp_code_bootstrap_path)
+    wpmcp_code_require_runtime "$runtime"
+    local client_dir="$WPMCP_HOME/lib/code"
+    wpmcp_code_extract_clients "$runtime"
 
     local work_dir
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/wpmcp-code.XXXXXX") || \
@@ -2475,9 +3172,13 @@ wpmcp_code() {
     trap 'wpmcp_code_cleanup; exit 130' INT
     trap 'wpmcp_code_cleanup; exit 143' TERM
 
+    local script_ext="php"
+    [ "$runtime" = "python" ] && script_ext="py"
+    [ "$runtime" = "node" ] && script_ext="js"
+
     local script_path
     if [ "$script" = "-" ]; then
-        script_path="$work_dir/stdin.php"
+        script_path="$work_dir/stdin.$script_ext"
         if ! cat > "$script_path"; then
             wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
                 "Could not read the script from STDIN."
@@ -2493,11 +3194,13 @@ wpmcp_code() {
     local out_file="$work_dir/stdout"
     local err_file="$work_dir/stderr"
     local log_file="$work_dir/calls.jsonl"
+    local state_file="$work_dir/state.json"
     local timeout_flag="$work_dir/timed-out"
     : > "$out_file"
     : > "$err_file"
     : > "$log_file"
-    chmod 600 "$out_file" "$err_file" "$log_file"
+    printf '%s' '{"seq":0,"executions":0,"total_calls":0,"annotations":{},"definitions":{}}' > "$state_file"
+    chmod 600 "$out_file" "$err_file" "$log_file" "$state_file"
 
     local sha
     sha=$(wpmcp_code_sha256 "$script_path")
@@ -2506,25 +3209,37 @@ wpmcp_code() {
         local display="$script"
         [ "$script" = "-" ] && display="<stdin>"
         printf 'Script: %s (sha256 %s)\n' "$display" "$sha" >&2
+        printf 'Runtime: %s\n' "$runtime" >&2
     fi
 
     export WPMCP_CODE_CLI="${WPMCP_CODE_CLI:-$(wpmcp_code_cli_path)}"
+    export WPMCP_CODE_BRIDGE_CLI="$(wpmcp_code_cli_path)"
     export WPMCP_CODE_SITE="$WPMCP_ACTIVE_SITE"
     export WPMCP_CODE_SITE_URL="$site_url"
     export WPMCP_CODE_ORIGIN="${WPMCP_ACTIVE_ORIGIN:-}"
     export WPMCP_CODE_LOG="$log_file"
+    export WPMCP_CODE_STATE="$state_file"
+    export WPMCP_CODE_STARTED_AT="$(date +%s)"
+    export WPMCP_CODE_SCRIPT="$script_path"
+    export WPMCP_CODE_RUNTIME="$runtime"
     export WPMCP_CODE_DRY_RUN="$dry_run"
     export WPMCP_CODE_READ_ONLY="$read_only"
     export WPMCP_CODE_ALLOW_DESTRUCTIVE="$yes"
     export WPMCP_CODE_MAX_CALLS="$max_calls"
     export WPMCP_CODE_TIMEOUT="$timeout"
     export WPMCP_CODE_VERBOSE="$verbose"
+    if [ "${#allow_list[@]}" -gt 0 ]; then
+        WPMCP_CODE_ALLOW=$(printf '%s\n' "${allow_list[@]}")
+        export WPMCP_CODE_ALLOW
+    else
+        export WPMCP_CODE_ALLOW=""
+    fi
     if [ -n "${WPMCP_HTTP_TIMEOUT:-}" ]; then
         export WPMCP_HTTP_TIMEOUT
     fi
 
     local status=0
-    wpmcp_code_run_php "$script_path" "$bootstrap" "$out_file" "$err_file" "$timeout" "$timeout_flag" || status=$?
+    wpmcp_code_run_runtime "$runtime" "$script_path" "$client_dir" "$out_file" "$err_file" "$timeout" "$timeout_flag" || status=$?
 
     local timed_out=0
     [ -f "$timeout_flag" ] && timed_out=1
@@ -2714,7 +3429,17 @@ wpmcp_doctor() {
     if wpmcp_check_php; then
         results+=("OK|php available (code)|")
     else
-        results+=("WARN|php available (code)|PHP >= 8.0 with proc_open is required for wp-mcp code")
+        results+=("WARN|php available (code)|PHP >= 8.0 with proc_open is required for --runtime php")
+    fi
+    if wpmcp_check_python; then
+        results+=("OK|python3 available (code)|")
+    else
+        results+=("WARN|python3 available (code)|Python 3.8+ is required for --runtime python")
+    fi
+    if wpmcp_check_node; then
+        results+=("OK|node available (code)|")
+    else
+        results+=("WARN|node available (code)|Node.js 18+ is required for --runtime node")
     fi
 
     if [ "$offline" = "0" ]; then
@@ -2781,6 +3506,16 @@ wpmcp_check_php() {
     php -r 'exit(PHP_VERSION_ID >= 80000 ? 0 : 1);' >/dev/null 2>&1 || return 1
     php -r 'exit(function_exists("proc_open") ? 0 : 1);' >/dev/null 2>&1 || return 1
     return 0
+}
+
+wpmcp_check_python() {
+    wpmcp_command_exists python3 || return 1
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1
+}
+
+wpmcp_check_node() {
+    wpmcp_command_exists node || return 1
+    node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 18 ? 0 : 1)' >/dev/null 2>&1
 }
 
 wpmcp_check_active_site() {

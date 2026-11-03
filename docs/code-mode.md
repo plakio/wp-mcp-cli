@@ -39,11 +39,20 @@ corrections:
   default mode.
 - `--read-only` is the real-data planning mode. `--dry-run` stubs every
   ability call; metadata search/describe still run.
-- `wp_mcp_search()` and `wp_mcp_describe()` reuse the plugin's compact
-  `mcp-adapter/discover-abilities` and `wp-mcp/get-ability-info` abilities
-  through the existing REST shim. There is no local catalog cache in v1.
-- The bootstrap calls `wp-mcp --json run` for every ability instead of
-  duplicating the HTTP client, URL builder and error table.
+- `wp_mcp_search()` reuses the plugin's compact
+  `mcp-adapter/discover-abilities` ability; `wp_mcp_describe()` uses the CLI's
+  ability description route. There is no local catalog cache in v1.
+- A common local bridge (`wp-mcp __code-bridge`) owns modes, budgets,
+  annotations and the call log. The PHP, Python and Node clients are thin
+  wrappers around it.
+- `--runtime php|python|node` is supported. The runtime is inferred from the
+  file extension or selected explicitly; the bridge itself only needs Bash,
+  `jq` and `curl`, so Python/Node users do not need PHP.
+- `--allow <ability>` permits specific destructive abilities as an alternative
+  to the blanket `--yes`. It is repeatable and mutually exclusive with
+  `--yes`.
+- The bridge calls `wp-mcp --json run`/`describe` instead of duplicating the
+  HTTP client, URL builder and error table.
 - The call log is append-only JSONL so a killed script still reports the
   calls it made.
 - Credentials were hardened first: no stored password in child argv or the
@@ -149,10 +158,11 @@ The command is additive. No existing command changes behavior.
 |---|---|---|
 | `--dry-run` | off | Execute nothing. Every ability call is logged and returns a stub. |
 | `--read-only` | off | Execute only `readonly=true` abilities; stub every write. |
-| `--yes` / `-y` | off | Allow destructive abilities to execute. |
+| `--yes` / `-y` | off | Allow all destructive abilities to execute. |
+| `--allow <ability>` | none | Allow one destructive ability. Repeatable; mutually exclusive with `--yes`. |
 | `--max-calls <n>` | 100 | Maximum ability calls in one script. Range 1–1000. |
 | `--timeout <seconds>` | 120 | Maximum wall time. Range 1–3600. |
-| `--runtime <php>` | `php` | Script runtime. v1 supports `php` only; `node` is reserved. |
+| `--runtime <r>` | inferred | `php`, `python` or `node`. Inferred from `.php`, `.py`, `.js`, `.mjs`, `.cjs`; stdin defaults to `php`. |
 | `--verbose` | off | Include per-call input sizes in the log. Never includes bodies or credentials. |
 | `--help` / `-h` | — | Show command help. |
 
@@ -163,7 +173,11 @@ must appear before the command, as with every other command.
 
 ```bash
 # Read-only script
-wp-mcp code audit.php
+wp-mcp code audit.php --read-only
+
+# Python or Node script (runtime inferred from the extension)
+wp-mcp code audit.py --read-only
+wp-mcp code audit.js --read-only
 
 # Plan writes without executing them
 wp-mcp code migrate.php --dry-run
@@ -173,6 +187,9 @@ wp-mcp code migrate.php --read-only
 
 # Execute everything, including destructive abilities
 wp-mcp code migrate.php --yes
+
+# Or allow only specific destructive abilities
+wp-mcp code migrate.php --allow wp-mcp/content-delete-post
 
 # Script from STDIN (useful for agents)
 wp-mcp code - --dry-run <<'PHP'
@@ -190,15 +207,14 @@ PHP
 ### 5.4 Script lifecycle
 
 1. Parse flags and resolve the active site (`wpmcp_auth_require`).
-2. Check the runtime (`php` exists, PHP >= 8.0).
-3. Extract the bundled bootstrap to `$WPMCP_HOME/lib/code-bootstrap.php` if it
-   is missing or its version changed.
-4. Create a temporary call-log file with mode `0600`.
-5. Run the script with `php -d auto_prepend_file=<bootstrap>`.
-6. Read the call log and the script's stdout/stderr.
+2. Select the runtime (`php`, `python` or `node`) and check its executable.
+3. Extract the thin clients to `$WPMCP_HOME/lib/code` if their version changed.
+4. Create temporary call-log/state files with mode `0600`.
+5. Run the script with the selected runtime. The client talks to the common
+   `wp-mcp __code-bridge` command for calls, metadata and modes.
+6. Read the call log/state and the script's stdout/stderr.
 7. Emit the success or error envelope and exit with the mapped code.
-8. Remove the temporary script (if read from STDIN) and the temporary log.
-   Keep the bootstrap.
+8. Remove the temporary script (if read from STDIN), state and log.
 
 ---
 
@@ -241,7 +257,7 @@ function wp_mcp_discover(array $options = []): array;
 
 /**
  * Fetch one ability definition (name, label, description, input_schema,
- * output_schema, meta.annotations) through wp-mcp/get-ability-info.
+ * output_schema, meta.annotations) through the CLI's describe route.
  */
 function wp_mcp_describe(string $ability): array;
 
@@ -300,22 +316,28 @@ The CLI passes non-secret configuration through the child environment:
 
 | Variable | Meaning |
 |---|---|
-| `WPMCP_CODE_CLI` | Absolute path to the `wp-mcp` executable used for child calls. |
+| `WPMCP_CODE_CLI` | `wp-mcp` executable used by the bridge for ability calls. |
+| `WPMCP_CODE_BRIDGE_CLI` | Real `wp-mcp` executable used by the thin clients for `__code-bridge`. |
+| `WPMCP_CODE_STATE` | Path to the bridge budget/annotation state JSON. |
+| `WPMCP_CODE_SCRIPT` | Script path (used by the Python runner). |
+| `WPMCP_CODE_RUNTIME` | `php`, `python` or `node`. |
 | `WPMCP_CODE_SITE` | Active profile name. |
 | `WPMCP_CODE_SITE_URL` | The profile's `siteUrl`, including any subdirectory. |
 | `WPMCP_CODE_ORIGIN` | Scheme + host + port (for `wp_mcp_site()`). |
 | `WPMCP_CODE_LOG` | Path to the append-only JSONL call log. |
 | `WPMCP_CODE_DRY_RUN` | `1` or `0`. |
 | `WPMCP_CODE_READ_ONLY` | `1` or `0`. |
-| `WPMCP_CODE_ALLOW_DESTRUCTIVE` | `1` or `0`. |
+| `WPMCP_CODE_ALLOW_DESTRUCTIVE` | `1` or `0` for `--yes`. |
+| `WPMCP_CODE_ALLOW` | Newline-separated `--allow` ability names. |
 | `WPMCP_CODE_MAX_CALLS` | Integer. |
 | `WPMCP_CODE_TIMEOUT` | Integer seconds. |
+| `WPMCP_CODE_STARTED_AT` | Unix timestamp used for the bridge timeout. |
 | `WPMCP_CODE_VERBOSE` | `1` or `0`. |
 | `WPMCP_REST_PLAIN` | Inherited; `1` uses `?rest_route=`. |
 
 The application password is **never** passed to child processes in argv or
-in the environment. The bootstrap does not read it: each child `wp-mcp run`
-reads the existing `0600` credentials file.
+in the environment. Neither the clients nor the bridge read it: each child
+`wp-mcp run`/`describe` reads the existing `0600` credentials file.
 
 ---
 
@@ -362,8 +384,8 @@ Scripts that need real data to plan should use `--read-only`.
 ### 7.3 Annotations and confirmations
 
 Before each call, `wp_mcp_call` resolves the ability's annotations through
-`wp-mcp/get-ability-info` (`detail=full`) on the REST shim and caches them in
-memory. Search results also seed the annotation cache.
+the CLI's `describe` route (the native ability record) and caches them in the
+bridge state. Search results also seed the annotation cache.
 
 - In `--read-only`, only `readonly === true` executes; every other ability is
   stubbed and logged as `skipped`.
@@ -542,10 +564,11 @@ and must be documented there.
 
 ## 9. Implementation
 
-> The implemented MVP follows the deltas in section 1: the bootstrap invokes
-> `wp-mcp --json run` and uses the plugin's discovery/info abilities. The
-> direct PHP HTTP layer and disk catalog cache described below are retained
-> as the original design, not as the current code path.
+> The implemented MVP follows the deltas in section 1: the thin PHP, Python
+> and Node clients call the common `wp-mcp __code-bridge` command, which
+> invokes `wp-mcp --json run`/`describe` and uses the plugin's compact
+> discovery. The direct PHP HTTP layer and disk catalog cache described below
+> are retained as the original design, not as the current code path.
 
 ### 9.1 Files
 
@@ -741,6 +764,11 @@ Use the existing disposable-site setup.
     first row returns `input_schema`.
 12. Script with a PHP parse error → exit 5, `script_error`, stderr tail in the
     error details.
+13. Python and Node read scripts → exit 0 with the same output and modes;
+    `--runtime` overrides the extension inference.
+14. `--allow wp-mcp/content-delete-post` allows that destructive ability but
+    still blocks another destructive ability with exit 6.
+15. `--allow` with `--yes` is a usage error.
 
 ### Security tests
 
@@ -832,14 +860,20 @@ Add a one-line pointer to the code-mode section.
 - [ ] `--read-only` executes only `readonly=true` abilities and stubs all
       writes, including non-destructive ones.
 - [ ] `--max-calls` and `--timeout` are enforced.
+- [ ] `--allow` permits only the named destructive abilities; it cannot be
+      combined with `--yes`.
+- [ ] PHP, Python and Node clients all use the same bridge and produce the
+      same envelope/modes.
 - [ ] The application password never appears in argv, logs or envelopes.
 - [ ] Unknown annotations fail closed.
 - [ ] `--json` does not imply `--yes`.
-- [ ] `doctor` reports PHP availability without failing other commands.
-- [ ] `compile.sh` produces a single `wp-mcp.sh` containing the bootstrap.
+- [ ] `doctor` reports PHP, Python and Node availability without failing
+      other commands.
+- [ ] `compile.sh` produces a single `wp-mcp.sh` containing the bridge and
+      client templates.
 - [ ] README, `docs/v1-contract.md`, the skill and this document are updated.
 - [ ] Smoke tests pass on a disposable site.
-- [ ] `php -l` passes on the extracted bootstrap.
+- [ ] The selected client passes its runtime syntax check.
 
 ---
 

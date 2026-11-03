@@ -90,8 +90,46 @@ cat > "$FAKE_CLI" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The real CLI invokes: fake-wp-mcp --json run <ability> --input -
-if [ "${1:-}" != "--json" ] || [ "${2:-}" != "run" ]; then
+error() {
+    jq -nc --arg code "$1" --arg message "$2" \
+        '{ok:false,error:{code:$code,message:$message,retryable:false,remoteCode:"",details:null}}' >&2
+    exit "${3:-5}"
+}
+
+fake_definition() {
+    local name="$1"
+    case "$name" in
+        wp-mcp/content-list-posts)
+            jq -nc --arg name "$name" '{name:$name,label:$name,description:"test ability",category:"test",input_schema:{type:"object"},output_schema:{type:"object"},meta:{annotations:{readonly:true,destructive:false,idempotent:true}}}'
+            ;;
+        wp-mcp/content-update-post|wp-mcp/write-file)
+            jq -nc --arg name "$name" '{name:$name,label:$name,description:"test ability",category:"test",input_schema:{type:"object"},output_schema:{type:"object"},meta:{annotations:{readonly:false,destructive:false,idempotent:false}}}'
+            ;;
+        wp-mcp/content-delete-post)
+            jq -nc --arg name "$name" '{name:$name,label:$name,description:"test ability",category:"test",input_schema:{type:"object"},output_schema:{type:"object"},meta:{annotations:{readonly:false,destructive:true,idempotent:false}}}'
+            ;;
+        wp-mcp/no-annotations)
+            jq -nc --arg name "$name" '{name:$name,label:$name,description:"test ability",category:"test",input_schema:{type:"object"},output_schema:{type:"object"},meta:{}}'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+if [ "${1:-}" != "--json" ]; then
+    echo "unexpected arguments: $*" >&2
+    exit 1
+fi
+
+if [ "${2:-}" = "describe" ]; then
+    ability="${3:?ability required}"
+    data=$(fake_definition "$ability") || error "wp_mcp_ability_not_found" "Ability '$ability' is not registered." 2
+    jq -nc --argjson data "$data" '{ok:true,data:$data,meta:{site:"test",http_status:200}}'
+    exit 0
+fi
+
+if [ "${2:-}" != "run" ]; then
     echo "unexpected arguments: $*" >&2
     exit 1
 fi
@@ -104,47 +142,11 @@ input=$(cat)
 home="${WPMCP_HOME:?WPMCP_HOME required}"
 executions="$home/code-executions.log"
 
-error() {
-    jq -nc --arg code "$1" --arg message "$2" \
-        '{ok:false,error:{code:$code,message:$message,retryable:false,remoteCode:"",details:null}}' >&2
-    exit "${3:-5}"
-}
-
 data=""
 case "$ability" in
     wp-mcp/get-ability-info)
         target=$(printf '%s' "$input" | jq -r '.ability_name // empty')
-        no_annotations=0
-        case "$target" in
-            wp-mcp/content-list-posts)
-                readonly=true
-                destructive=false
-                ;;
-            wp-mcp/content-update-post|wp-mcp/write-file)
-                readonly=false
-                destructive=false
-                ;;
-            wp-mcp/content-delete-post)
-                readonly=false
-                destructive=true
-                ;;
-            wp-mcp/no-annotations)
-                no_annotations=1
-                ;;
-            *)
-                error "wp_mcp_ability_not_found" "Ability '$target' is not registered." 2
-                ;;
-        esac
-        if [ "$no_annotations" = "1" ]; then
-            data=$(jq -nc --arg name "$target" \
-                '{name:$name,label:$name,description:"test ability",category:"test",input_schema:{type:"object"},output_schema:{type:"object"},meta:{}}')
-        else
-            data=$(jq -nc \
-                --arg name "$target" \
-                --argjson readonly "$readonly" \
-                --argjson destructive "$destructive" \
-                '{name:$name,label:$name,description:"test ability",category:"test",input_schema:{type:"object"},output_schema:{type:"object"},meta:{annotations:{readonly:$readonly,destructive:$destructive,idempotent:false}}}')
-        fi
+        data=$(fake_definition "$target") || error "wp_mcp_ability_not_found" "Ability '$target' is not registered." 2
         ;;
     mcp-adapter/discover-abilities)
         data=$(jq -nc '{
@@ -324,6 +326,38 @@ script site <<'PHP'
 echo wp_mcp_site()['name'];
 PHP
 
+cat > "$TEST_DIR/read.py" <<'PY'
+result = wp_mcp_call("wp-mcp/content-list-posts", {"per_page": 1})
+print(result["posts"][0]["title"])
+PY
+
+cat > "$TEST_DIR/read.js" <<'JS'
+const result = wp_mcp_call("wp-mcp/content-list-posts", { per_page: 1 });
+console.log(result.posts[0].title);
+JS
+
+cat > "$TEST_DIR/update.py" <<'PY'
+result = wp_mcp_call("wp-mcp/content-update-post", {
+    "id": 1,
+    "status": "publish",
+    "confirm_update": True,
+})
+print("skipped" if result.get("__wp_mcp_skipped") else "executed")
+PY
+
+cat > "$TEST_DIR/delete.js" <<'JS'
+wp_mcp_call("wp-mcp/content-delete-post", { id: 1, confirm_delete: true });
+console.log("deleted");
+JS
+
+cat > "$TEST_DIR/unknown.py" <<'PY'
+wp_mcp_call("wp-mcp/unknown-ability", {})
+PY
+
+cat > "$TEST_DIR/unknown.js" <<'JS'
+wp_mcp_call("wp-mcp/unknown-ability", {});
+JS
+
 script jsonout <<'PHP'
 <?php
 echo json_encode(['value' => 42]);
@@ -430,6 +464,54 @@ assert_eq "destructive with yes exits 0" "$CODE_RC" "0"
 assert_eq "destructive with yes output" "$(json_field "$CODE_OUT" '.data.output')" "deleted"
 assert_eq "destructive with yes executes" "$(executed wp-mcp/content-delete-post && echo yes || echo no)" "yes"
 
+reset_executions
+run_code json "$TEST_DIR/delete.php" --allow wp-mcp/content-delete-post
+assert_eq "allow destructive exits 0" "$CODE_RC" "0"
+assert_eq "allow destructive output" "$(json_field "$CODE_OUT" '.data.output')" "deleted"
+assert_eq "allow destructive executes" "$(executed wp-mcp/content-delete-post && echo yes || echo no)" "yes"
+
+reset_executions
+run_code json "$TEST_DIR/delete.php" --allow wp-mcp/content-update-post
+assert_eq "allow other destructive exits 6" "$CODE_RC" "6"
+assert_eq "allow other destructive code" "$(json_field "$CODE_ERR" '.error.code')" "confirmation_required"
+assert_eq "allow other destructive does not execute" "$(not_executed wp-mcp/content-delete-post && echo yes || echo no)" "yes"
+
+run_code json "$TEST_DIR/read.php" --allow wp-mcp/content-delete-post --yes
+assert_eq "allow with yes exits 2" "$CODE_RC" "2"
+
+run_code json "$TEST_DIR/read.php" --allow '../etc/passwd'
+assert_eq "invalid allow exits 2" "$CODE_RC" "2"
+
+# Python and Node clients use the same bridge.
+reset_executions
+run_code json "$TEST_DIR/read.py"
+assert_eq "python read exits 0" "$CODE_RC" "0"
+assert_eq "python read output" "$(json_field "$CODE_OUT" '.data.output')" "Hello"
+assert_eq "python read executes" "$(executed wp-mcp/content-list-posts && echo yes || echo no)" "yes"
+
+reset_executions
+run_code json "$TEST_DIR/read.js"
+assert_eq "node read exits 0" "$CODE_RC" "0"
+assert_eq "node read output" "$(json_field "$CODE_OUT" '.data.output')" "Hello"
+assert_eq "node read executes" "$(executed wp-mcp/content-list-posts && echo yes || echo no)" "yes"
+
+reset_executions
+run_code json "$TEST_DIR/update.py" --read-only
+assert_eq "python read-only exits 0" "$CODE_RC" "0"
+assert_eq "python read-only stubs write" "$(json_field "$CODE_OUT" '.data.output')" "skipped"
+assert_eq "python read-only does not execute" "$(not_executed wp-mcp/content-update-post && echo yes || echo no)" "yes"
+
+reset_executions
+run_code json "$TEST_DIR/delete.js" --allow wp-mcp/content-delete-post
+assert_eq "node allow destructive exits 0" "$CODE_RC" "0"
+assert_eq "node allow destructive executes" "$(executed wp-mcp/content-delete-post && echo yes || echo no)" "yes"
+
+cp "$TEST_DIR/read.py" "$TEST_DIR/read_no_ext"
+reset_executions
+run_code json "$TEST_DIR/read_no_ext" --runtime python
+assert_eq "explicit runtime exits 0" "$CODE_RC" "0"
+assert_eq "explicit runtime output" "$(json_field "$CODE_OUT" '.data.output')" "Hello"
+
 # --- search / describe / log ----------------------------------------------
 
 echo
@@ -463,6 +545,14 @@ run_code json "$TEST_DIR/unknown.php"
 assert_eq "unknown ability exits 2" "$CODE_RC" "2"
 assert_eq "unknown ability code" "$(json_field "$CODE_ERR" '.error.code')" "ability_not_found"
 assert_eq "unknown ability remote code" "$(json_field "$CODE_ERR" '.error.remoteCode')" "wp_mcp_ability_not_found"
+
+run_code json "$TEST_DIR/unknown.py"
+assert_eq "python unknown exits 2" "$CODE_RC" "2"
+assert_eq "python unknown code" "$(json_field "$CODE_ERR" '.error.code')" "ability_not_found"
+
+run_code json "$TEST_DIR/unknown.js"
+assert_eq "node unknown exits 2" "$CODE_RC" "2"
+assert_eq "node unknown code" "$(json_field "$CODE_ERR" '.error.code')" "ability_not_found"
 
 run_code json "$TEST_DIR/invalid.php"
 assert_eq "invalid ability name exits 2" "$CODE_RC" "2"
