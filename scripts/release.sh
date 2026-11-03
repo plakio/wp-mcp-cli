@@ -149,7 +149,7 @@ Steps:
   1. Update WPMCP_VERSION in main
   2. Compile wp-mcp.sh
   3. Validate bash syntax
-  4. Run no-site tests (hardening + code mode)
+  4. Run no-site tests (hardening, code mode, skill)
   5. Commit + push
   6. Tag v$TARGET_VERSION + push
   7. Create GitHub Release$( [ "$SKIP_RELEASE" = "1" ] && echo " (skipped by --skip-release)" || true )
