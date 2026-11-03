@@ -22,13 +22,30 @@ To release an explicit version:
 ./scripts/release.sh 0.1.1 --yes
 ```
 
+To preview the version, generated release notes and steps without changing
+anything:
+
+```bash
+./scripts/release.sh 0.2.1 --dry-run
+```
+
+To push the tag without creating a GitHub Release:
+
+```bash
+./scripts/release.sh 0.2.1 --yes --skip-release
+```
+
 The script:
 
-1. Updates `WPMCP_VERSION` in `main`.
-2. Compiles the Bash distributable (`wp-mcp.sh`) via `compile.sh`.
-3. Validates shell syntax with `bash -n`.
-4. Commits the version bump and pushes `main`.
-5. Creates and pushes tag `v<version>`.
+1. Generates release notes from commits since the previous tag.
+2. Updates `WPMCP_VERSION` in `main`.
+3. Compiles the Bash distributable (`wp-mcp.sh`) via `compile.sh`.
+4. Validates shell syntax with `bash -n`.
+5. Commits the version bump and pushes `main`.
+6. Creates and pushes tag `v<version>`.
+7. Creates a GitHub Release with the generated notes via `gh`, unless
+   `--skip-release` is passed. If `gh` is missing or not authenticated, the
+   tag is still pushed and the script prints a warning.
 
 The tag triggers `.github/workflows/notify-homebrew-tap.yml`, which sends a `new-release` repository dispatch event to `plakio/homebrew-tap`. The tap downloads the tag archive, calculates its SHA256, generates and tests the formula on macOS, and pushes the formula update.
 
@@ -48,6 +65,15 @@ Monitor the run with:
 
 ```bash
 gh run list --repo plakio/homebrew-tap --workflow update-wp-mcp-cli.yml
+```
+
+If the tag exists but the GitHub Release was not created, create it manually:
+
+```bash
+gh release create v<version> \
+  --repo plakio/wp-mcp-cli \
+  --title "wp-mcp-cli v<version>" \
+  --generate-notes
 ```
 
 The release tag is the source of truth. Do not manually edit the formula before the tag exists.
