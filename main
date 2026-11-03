@@ -19,7 +19,7 @@ WPMCP_PASSWORD_INPUT="${WPMCP_PASSWORD:-}"
 unset WPMCP_PASSWORD
 
 WPMCP_NAME="wp-mcp"
-WPMCP_VERSION="0.2.0"
+WPMCP_VERSION="0.3.0"
 WPMCP_HOME="${WPMCP_HOME:-$HOME/.wp-mcp}"
 
 # Ensure common user-managed binary locations are available when launched
