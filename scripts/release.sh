@@ -13,40 +13,75 @@ YES=0
 DRY_RUN=0
 SKIP_RELEASE=0
 TARGET_VERSION=""
+NOTES_FILE=""
 REPO_SLUG="plakio/wp-mcp-cli"
 
-for arg in "$@"; do
-    case "$arg" in
-        --yes|-y) YES=1 ;;
-        --dry-run) DRY_RUN=1 ;;
-        --skip-release) SKIP_RELEASE=1 ;;
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --yes|-y)
+            YES=1
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --skip-release)
+            SKIP_RELEASE=1
+            shift
+            ;;
+        --notes-file)
+            if [ "$#" -lt 2 ]; then
+                echo "--notes-file requires a path" >&2
+                exit 1
+            fi
+            NOTES_FILE="$2"
+            shift 2
+            ;;
+        --notes-file=*)
+            NOTES_FILE="${1#--notes-file=}"
+            shift
+            ;;
         --help|-h)
             cat <<'HELP'
 Usage:
-  scripts/release.sh [version] [--yes] [--dry-run] [--skip-release]
+  scripts/release.sh [version] [--yes] [--dry-run] [--skip-release] [--notes-file <path>]
 
 If no version is given, the patch component of WPMCP_VERSION is bumped.
 Pass --yes to skip the confirmation prompt.
-Pass --dry-run to print the plan and generated release notes without
-changing anything.
+Pass --dry-run to print the plan and release notes without changing anything.
 Pass --skip-release to push the tag without creating a GitHub Release.
+Pass --notes-file <path> to use curated Markdown notes instead of the
+generated commit list.
 HELP
             exit 0
             ;;
         --*)
-            echo "Unknown option: $arg" >&2
+            echo "Unknown option: $1" >&2
             exit 1
             ;;
         *)
             if [ -z "$TARGET_VERSION" ]; then
-                TARGET_VERSION="$arg"
+                TARGET_VERSION="$1"
             else
-                echo "Unexpected argument: $arg" >&2
+                echo "Unexpected argument: $1" >&2
                 exit 1
             fi
+            shift
             ;;
     esac
 done
+
+if [ -n "$NOTES_FILE" ]; then
+    case "$NOTES_FILE" in
+        /*) ;;
+        *) NOTES_FILE="$(pwd)/$NOTES_FILE" ;;
+    esac
+    if [ ! -f "$NOTES_FILE" ] || [ ! -r "$NOTES_FILE" ]; then
+        echo "Notes file not found or not readable: $NOTES_FILE" >&2
+        exit 1
+    fi
+fi
 
 cd "$(dirname "$0")/.."
 
@@ -73,26 +108,42 @@ if [ "$current" = "$TARGET_VERSION" ] && [ "$YES" != "1" ] && [ "$DRY_RUN" != "1
 fi
 
 previous_tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
-if [ -n "$previous_tag" ]; then
-    changes=$(git log --pretty=format:"- %s" "${previous_tag}..HEAD" 2>/dev/null || true)
-else
-    changes=$(git log --pretty=format:"- %s" HEAD 2>/dev/null || true)
-fi
-[ -n "$changes" ] || changes="- Release $TARGET_VERSION"
 
-notes="## What's changed
+if [ -n "$NOTES_FILE" ]; then
+    notes=$(cat "$NOTES_FILE")
+    if [ -z "$notes" ]; then
+        echo "Notes file is empty: $NOTES_FILE" >&2
+        exit 1
+    fi
+else
+    if [ -n "$previous_tag" ]; then
+        changes=$(git log --pretty=format:"- %s" "${previous_tag}..HEAD" 2>/dev/null || true)
+    else
+        changes=$(git log --pretty=format:"- %s" HEAD 2>/dev/null || true)
+    fi
+    [ -n "$changes" ] || changes="- Release $TARGET_VERSION"
+    notes="## What's changed
 
 $changes"
-if [ -n "$previous_tag" ]; then
+fi
+
+if [ -n "$previous_tag" ] && ! printf '%s' "$notes" | grep -Fq "Full Changelog"; then
     notes="$notes
 
 **Full Changelog**: https://github.com/${REPO_SLUG}/compare/${previous_tag}...v${TARGET_VERSION}"
+fi
+
+if [ -n "$NOTES_FILE" ]; then
+    notes_label="curated from $NOTES_FILE"
+else
+    notes_label="generated from commits"
 fi
 
 cat <<EOF
 About to release wp-mcp-cli $TARGET_VERSION
   (previous: $current)
   (previous tag: ${previous_tag:-none})
+  (notes: $notes_label)
 
 Steps:
   1. Update WPMCP_VERSION in main

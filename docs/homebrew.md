@@ -35,17 +35,29 @@ To push the tag without creating a GitHub Release:
 ./scripts/release.sh 0.2.1 --yes --skip-release
 ```
 
+To use curated Markdown notes instead of the generated commit list:
+
+```bash
+./scripts/release.sh 0.2.1 --dry-run --notes-file /tmp/release-notes.md
+./scripts/release.sh 0.2.1 --yes --notes-file /tmp/release-notes.md
+```
+
 The script:
 
-1. Generates release notes from commits since the previous tag.
+1. Uses the `--notes-file` content, or generates notes from commits since the
+   previous tag.
 2. Updates `WPMCP_VERSION` in `main`.
 3. Compiles the Bash distributable (`wp-mcp.sh`) via `compile.sh`.
 4. Validates shell syntax with `bash -n`.
 5. Commits the version bump and pushes `main`.
 6. Creates and pushes tag `v<version>`.
-7. Creates a GitHub Release with the generated notes via `gh`, unless
-   `--skip-release` is passed. If `gh` is missing or not authenticated, the
-   tag is still pushed and the script prints a warning.
+7. Creates a GitHub Release with the notes via `gh`, unless `--skip-release`
+   is passed. If `gh` is missing or not authenticated, the tag is still
+   pushed and the script prints a warning.
+
+For curated notes, start with the release's highlights, requirements, and
+validation. The script appends a **Full Changelog** link automatically when
+the notes do not already contain one.
 
 The tag triggers `.github/workflows/notify-homebrew-tap.yml`, which sends a `new-release` repository dispatch event to `plakio/homebrew-tap`. The tap downloads the tag archive, calculates its SHA256, generates and tests the formula on macOS, and pushes the formula update.
 
