@@ -3,6 +3,7 @@
 # Smoke tests for wp-mcp-cli. Runs against a real local Plak site.
 # Usage: WPMCP_TEST_URL=https://dev.localhost WPMCP_TEST_USER=admin \
 #        WPMCP_TEST_PASSWORD=<app-password> ./tests/smoke.sh
+# Optional: WPMCP_TEST_PATH overrides the site root used by list-directory.
 
 # SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
 # SPDX-License-Identifier: AGPL-3.0-or-later
@@ -17,6 +18,7 @@ WPMCP="${WPMCP:-$ROOT_DIR/wp-mcp.sh}"
 WPMCP_TEST_URL="${WPMCP_TEST_URL:-}"
 WPMCP_TEST_USER="${WPMCP_TEST_USER:-}"
 WPMCP_TEST_PASSWORD="${WPMCP_TEST_PASSWORD:-}"
+WPMCP_TEST_PATH="${WPMCP_TEST_PATH:-/Users/oscarhugopaz/Plak/Sites/dev.localhost/public}"
 
 if [ -z "$WPMCP_TEST_URL" ] || [ -z "$WPMCP_TEST_USER" ] || [ -z "$WPMCP_TEST_PASSWORD" ]; then
     echo "Skipping smoke tests: WPMCP_TEST_URL, WPMCP_TEST_USER, WPMCP_TEST_PASSWORD must be set." >&2
@@ -82,7 +84,8 @@ desc_name=$(run --json describe wp-mcp/list-directory | jq -r '.data.name')
 assert_eq "describe returns the right ability" "$desc_name" "wp-mcp/list-directory"
 
 # 7. run a readonly ability (non-destructive)
-total=$(run run wp-mcp/list-directory --input '{"path":"/Users/oscarhugopaz/Plak/Sites/dev.localhost/public"}' --json | jq -r '.data.total')
+list_input=$(jq -nc --arg path "$WPMCP_TEST_PATH" '{path:$path}')
+total=$(run run wp-mcp/list-directory --input "$list_input" --json | jq -r '.data.total')
 assert_eq "list-directory returns >=1 entry" "$([ "$total" -ge 1 ] && echo true || echo false)" "true"
 
 # 8. destructive ability without --yes returns confirmation_required
@@ -97,7 +100,53 @@ code=$(echo "$out" | jq -r '.error.code' 2>/dev/null || echo "")
 assert_eq "nonexistent ability returns exit 2" "$rc" "2"
 assert_eq "nonexistent ability returns wp_mcp_ability_not_found" "$code" "wp_mcp_ability_not_found"
 
-# 10. auth logout
+# 10. code mode: a read script executes and returns output.
+if command -v php >/dev/null 2>&1; then
+    cat > "$WPMCP_HOME/code-read.php" <<PHP
+<?php
+\$r = wp_mcp_call('wp-mcp/list-directory', [
+    'path' => '${WPMCP_TEST_PATH}',
+]);
+echo count(\$r['entries']);
+PHP
+    code_output=$(run --json code "$WPMCP_HOME/code-read.php" 2>/dev/null | jq -r '.data.output')
+    assert_eq "code read script returns output" "$([ -n "$code_output" ] && echo true || echo false)" "true"
+
+    # 11. code mode: search uses the plugin's compact discovery.
+    cat > "$WPMCP_HOME/code-search.php" <<'PHP'
+<?php
+$rows = wp_mcp_search('post', 5);
+echo count($rows);
+PHP
+    code_search=$(run --json code "$WPMCP_HOME/code-search.php" 2>/dev/null | jq -r '.data.output')
+    assert_eq "code search returns rows" "$([ "${code_search:-0}" -ge 1 ] && echo true || echo false)" "true"
+
+    # 12. code mode: destructive without --yes exits 6.
+    cat > "$WPMCP_HOME/code-delete.php" <<'PHP'
+<?php
+wp_mcp_call('wp-mcp/delete-file', ['path' => '/tmp/nope']);
+PHP
+    rc=0
+    out=$(run --json code "$WPMCP_HOME/code-delete.php" </dev/null 2>&1) || rc=$?
+    assert_eq "code destructive without --yes exits 6" "$rc" "6"
+
+    # 13. code mode: --read-only stubs a non-destructive write.
+    cat > "$WPMCP_HOME/code-write.php" <<'PHP'
+<?php
+$r = wp_mcp_call('wp-mcp/write-file', [
+    'path' => 'wp-content/wp-mcp-sandbox/code-mode-smoke.txt',
+    'content' => 'should not be written',
+]);
+echo isset($r['__wp_mcp_skipped']) ? 'skipped' : 'executed';
+PHP
+    code_write=$(run --json code "$WPMCP_HOME/code-write.php" --read-only 2>/dev/null)
+    assert_eq "code read-only stubs write output" "$(echo "$code_write" | jq -r '.data.output')" "skipped"
+    assert_eq "code read-only call status" "$(echo "$code_write" | jq -r '.data.calls[] | select(.kind == "call") | .status')" "skipped"
+else
+    echo "  SKIP  code mode tests (php not found)"
+fi
+
+# 14. auth logout
 logout_ok=$(run --json auth logout | jq -r '.ok')
 assert_eq "auth logout ok" "$logout_ok" "true"
 

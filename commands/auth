@@ -77,8 +77,8 @@ wpmcp_auth_login() {
     if [ -z "$user" ] && [ -n "${WPMCP_USERNAME:-}" ]; then
         user="$WPMCP_USERNAME"
     fi
-    if [ -z "$pass" ] && [ -n "${WPMCP_PASSWORD:-}" ]; then
-        pass="$WPMCP_PASSWORD"
+    if [ -z "$pass" ] && [ -n "${WPMCP_PASSWORD_INPUT:-}" ]; then
+        pass="$WPMCP_PASSWORD_INPUT"
     fi
 
     local missing=()
@@ -107,6 +107,10 @@ wpmcp_auth_login() {
         fi
     fi
 
+    # Do not let a password supplied through the environment reach the
+    # child processes (curl, jq) used by the probe and the credential save.
+    unset WPMCP_PASSWORD
+
     url=$(printf '%s' "$url" | sed 's:/*$::')
 
     # Derive origin (scheme://host[:port]) and default name.
@@ -122,16 +126,18 @@ wpmcp_auth_login() {
     # Quick connectivity check before persisting.
     WPMCP_ACTIVE_USER="$user"
     WPMCP_ACTIVE_PASS="$pass"
-    export WPMCP_ACTIVE_USER WPMCP_ACTIVE_PASS
+    # Keep the application password out of child environments; the probe
+    # sends it through curl's config-on-STDIN path.
+    export -n WPMCP_ACTIVE_PASS 2>/dev/null || true
+    export WPMCP_ACTIVE_USER
     WPMCP_ACTIVE_SITE="$name"
     WPMCP_ACTIVE_ORIGIN="$origin"
     export WPMCP_ACTIVE_SITE WPMCP_ACTIVE_ORIGIN
 
     local probe_url="$url/wp-json/wp/v2/users/me"
-    local probe_raw
-    probe_raw=$(wpmcp_http_get "$probe_url")
-    local probe_rc=$?
-    if [ $probe_rc -ne 0 ]; then
+    local probe_raw probe_rc=0
+    probe_raw=$(wpmcp_http_get "$probe_url") || probe_rc=$?
+    if [ "$probe_rc" -ne 0 ]; then
         wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
             "Failed to reach $probe_url (curl exit $probe_rc)"
     fi
@@ -216,7 +222,7 @@ wpmcp_auth_status() {
     done < <(echo "$entries" | jq -c '.[]')
 
     if [ "$WPMCP_JSON" = "1" ]; then
-        jq -nc --argjson data "$annotated" '{ok:true,data:$data,meta:{}}'
+        printf '%s' "$annotated" | jq -c '{ok:true,data:.,meta:{}}'
         return 0
     fi
 

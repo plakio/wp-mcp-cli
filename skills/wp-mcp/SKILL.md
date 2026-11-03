@@ -18,6 +18,8 @@ and exposes the same `WP_Ability` registry that the MCP server uses.
   WP-MCP → Configuration admin page in your WordPress dashboard.
 - An ability is the atomic unit of work. Discover → describe → run is
   the canonical 3-step pattern.
+- For loops, pagination or batch work, use `wp-mcp code`. Plan with
+  `--read-only`, review the stubbed writes, then execute with `--yes`.
 - Destructive abilities (`destructive: true` in annotations) require
   `--yes` in non-TTY contexts. The CLI never auto-confirms.
 - A new ability registered via `wp_register_ability()` with
@@ -96,6 +98,7 @@ wp-mcp run wp-mcp/list-directory --input '{"path":"/Users"}'
 wp-mcp run wp-mcp/read-file --input @request.json
 cat request.json | wp-mcp run wp-mcp/execute-php --input -
 wp-mcp run wp-mcp/delete-file --input '{"path":"/tmp/x"}' --yes
+wp-mcp code audit.php --read-only
 ```
 
 ## Discover → Describe → Run
@@ -113,6 +116,43 @@ The canonical workflow for an agent:
    `POST /wp-json/wp-mcp/v1/abilities/<ns>/<name>/run` with body
    `{"input":<json>}`.
 
+## Code mode
+
+Use `wp-mcp code` when a task needs loops, conditionals, pagination or many
+ability calls. The PHP script runs on the local machine and calls the same
+REST shim as `wp-mcp run`; the site's access rules still apply.
+
+1. **Plan.** Write a PHP script using `wp_mcp_search()`, `wp_mcp_describe()`,
+   `wp_mcp_call()` and `wp_mcp_log()`. Show the script to the human.
+2. **Read.** Run it with `--read-only`. Reads execute; every write is stubbed
+   and appears in `data.calls` as `skipped`.
+3. **Approve.** Review the plan. Only then run with `--yes`.
+4. **Bound it.** Use `--max-calls` and `--timeout` for large scripts.
+
+```php
+<?php
+$rows = wp_mcp_search('post', 10);
+foreach ($rows as $row) {
+    echo $row['name'] . "\n";
+}
+```
+
+Modes:
+
+- default: reads and non-destructive writes execute; destructive abilities
+  exit 6 unless `--yes`.
+- `--read-only`: only `readonly=true` abilities execute; all writes are
+  stubbed. This is the mode for a real-data plan.
+- `--dry-run`: every ability call is stubbed. Metadata search/describe still
+  run; use this only when the script does not need real data.
+- `--yes`: allow destructive abilities. It only permits the call; it does not
+  inject the ability's `confirm_*` argument, so pass that explicitly.
+
+The script is **not** a sandbox. It has the local user's permissions and can
+read local files or make network requests. Review agent-generated scripts
+before running them. Do not call `wp-mcp/execute-php` from a code script
+unless the human explicitly asked for server-side execution.
+
 ## Input handling
 
 The `--input` flag accepts:
@@ -126,7 +166,9 @@ The `--input` flag accepts:
 
 `wp-mcp auth login <url>` stores a WordPress Application Password at
 `~/.wp-mcp/credentials/<site>.json` with `chmod 0600`. The CLI never
-prints the password back. To rotate, `wp-mcp auth logout && wp-mcp auth login`.
+prints the password back, and the stored password is not exported to child
+processes or passed to curl/jq in their argv. To rotate,
+`wp-mcp auth logout && wp-mcp auth login`.
 
 **Non-interactive flags** (for CI/scripts/agents with no TTY):
 
@@ -166,6 +208,7 @@ When editing wp-mcp-cli:
 1. Read `AGENTS.md` first.
 2. Compile after source edits: `./compile.sh`.
 3. Validate: `bash -n main shared/* commands/* compile.sh install.sh wp-mcp.sh`.
-4. Smoke test against a real site: `./tests/smoke.sh` (when present).
+4. Run the no-site tests: `./tests/hardening.sh` and `./tests/code.sh`.
+5. Smoke test against a real site: `./tests/smoke.sh` (when present).
 5. Releases are triggered by tag `v<version>`; the tag automatically
    notifies the Homebrew tap via `.github/workflows/notify-homebrew-tap.yml`.

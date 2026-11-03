@@ -1,0 +1,211 @@
+# SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# wp-mcp code <file|-> [flags]
+# Runs a local PHP script that calls WP-MCP abilities through the CLI's
+# existing `run` command. The script runs on the operator's machine; it is
+# not a sandbox.
+
+wpmcp_code() {
+    local script=""
+    local dry_run=0
+    local read_only=0
+    local yes=0
+    local max_calls=100
+    local timeout=120
+    local verbose=0
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            --read-only)
+                read_only=1
+                shift
+                ;;
+            --yes|-y)
+                yes=1
+                shift
+                ;;
+            --max-calls)
+                if [ "$#" -lt 2 ]; then
+                    wpmcp_error_usage "--max-calls requires a value"
+                fi
+                max_calls="$2"
+                shift 2
+                ;;
+            --max-calls=*)
+                max_calls="${1#--max-calls=}"
+                shift
+                ;;
+            --timeout)
+                if [ "$#" -lt 2 ]; then
+                    wpmcp_error_usage "--timeout requires a value"
+                fi
+                timeout="$2"
+                shift 2
+                ;;
+            --timeout=*)
+                timeout="${1#--timeout=}"
+                shift
+                ;;
+            --verbose)
+                verbose=1
+                shift
+                ;;
+            --help|-h)
+                wpmcp_display_command_help code
+                return 0
+                ;;
+            --)
+                shift
+                if [ "$#" -gt 0 ]; then
+                    script="$1"
+                    shift
+                fi
+                if [ "$#" -gt 0 ]; then
+                    wpmcp_error_usage "Unexpected argument: $1"
+                fi
+                ;;
+            -)
+                if [ -z "$script" ]; then
+                    script="$1"
+                    shift
+                else
+                    wpmcp_error_usage "Unexpected argument: $1"
+                fi
+                ;;
+            -*)
+                wpmcp_error_usage "Unknown code flag: $1"
+                ;;
+            *)
+                if [ -z "$script" ]; then
+                    script="$1"
+                    shift
+                else
+                    wpmcp_error_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -z "$script" ]; then
+        wpmcp_error_usage "Usage: wp-mcp code <file|-> [flags]"
+    fi
+    case "$max_calls" in
+        ''|*[!0-9]*)
+            wpmcp_error_usage "--max-calls must be an integer between 1 and 1000"
+            ;;
+    esac
+    max_calls=$((10#$max_calls))
+    if [ "$max_calls" -lt 1 ] || [ "$max_calls" -gt 1000 ]; then
+        wpmcp_error_usage "--max-calls must be between 1 and 1000"
+    fi
+    case "$timeout" in
+        ''|*[!0-9]*)
+            wpmcp_error_usage "--timeout must be an integer between 1 and 3600"
+            ;;
+    esac
+    timeout=$((10#$timeout))
+    if [ "$timeout" -lt 1 ] || [ "$timeout" -gt 3600 ]; then
+        wpmcp_error_usage "--timeout must be between 1 and 3600"
+    fi
+    if [ "$dry_run" = "1" ] && [ "$read_only" = "1" ]; then
+        wpmcp_error_usage "--dry-run and --read-only are mutually exclusive"
+    fi
+    if [ "$yes" = "1" ] && { [ "$dry_run" = "1" ] || [ "$read_only" = "1" ]; }; then
+        wpmcp_error_usage "--yes cannot be combined with --dry-run or --read-only"
+    fi
+
+    wpmcp_paths_init
+    wpmcp_config_resolve_site
+    if ! wpmcp_auth_check "$WPMCP_ACTIVE_SITE"; then
+        wpmcp_error_auth_required "$WPMCP_ACTIVE_SITE"
+    fi
+
+    local site_url
+    site_url=$(wpmcp_config_get_profile "$WPMCP_ACTIVE_SITE" | jq -r '.siteUrl // empty')
+    if [ -z "$site_url" ]; then
+        wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+            "Active site has no siteUrl: $WPMCP_ACTIVE_SITE"
+    fi
+
+    wpmcp_code_require_php
+    wpmcp_code_extract_bootstrap
+    local bootstrap
+    bootstrap=$(wpmcp_code_bootstrap_path)
+
+    local work_dir
+    work_dir=$(mktemp -d "${TMPDIR:-/tmp}/wpmcp-code.XXXXXX") || \
+        wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+            "Could not create a temporary directory."
+    chmod 700 "$work_dir"
+    WPMCP_CODE_WORK_DIR="$work_dir"
+    trap wpmcp_code_cleanup EXIT
+    trap 'wpmcp_code_cleanup; exit 130' INT
+    trap 'wpmcp_code_cleanup; exit 143' TERM
+
+    local script_path
+    if [ "$script" = "-" ]; then
+        script_path="$work_dir/stdin.php"
+        if ! cat > "$script_path"; then
+            wpmcp_error_print "internal_error" "$WPMCP_ERROR_INTERNAL" \
+                "Could not read the script from STDIN."
+        fi
+        chmod 600 "$script_path"
+    else
+        if [ ! -f "$script" ] || [ ! -r "$script" ]; then
+            wpmcp_error_usage "Script not found or not readable: $script"
+        fi
+        script_path="$script"
+    fi
+
+    local out_file="$work_dir/stdout"
+    local err_file="$work_dir/stderr"
+    local log_file="$work_dir/calls.jsonl"
+    local timeout_flag="$work_dir/timed-out"
+    : > "$out_file"
+    : > "$err_file"
+    : > "$log_file"
+    chmod 600 "$out_file" "$err_file" "$log_file"
+
+    local sha
+    sha=$(wpmcp_code_sha256 "$script_path")
+
+    if [ "$WPMCP_JSON" != "1" ] && [ "$WPMCP_QUIET" != "1" ]; then
+        local display="$script"
+        [ "$script" = "-" ] && display="<stdin>"
+        printf 'Script: %s (sha256 %s)\n' "$display" "$sha" >&2
+    fi
+
+    export WPMCP_CODE_CLI="${WPMCP_CODE_CLI:-$(wpmcp_code_cli_path)}"
+    export WPMCP_CODE_SITE="$WPMCP_ACTIVE_SITE"
+    export WPMCP_CODE_SITE_URL="$site_url"
+    export WPMCP_CODE_ORIGIN="${WPMCP_ACTIVE_ORIGIN:-}"
+    export WPMCP_CODE_LOG="$log_file"
+    export WPMCP_CODE_DRY_RUN="$dry_run"
+    export WPMCP_CODE_READ_ONLY="$read_only"
+    export WPMCP_CODE_ALLOW_DESTRUCTIVE="$yes"
+    export WPMCP_CODE_MAX_CALLS="$max_calls"
+    export WPMCP_CODE_TIMEOUT="$timeout"
+    export WPMCP_CODE_VERBOSE="$verbose"
+    if [ -n "${WPMCP_HTTP_TIMEOUT:-}" ]; then
+        export WPMCP_HTTP_TIMEOUT
+    fi
+
+    local status=0
+    wpmcp_code_run_php "$script_path" "$bootstrap" "$out_file" "$err_file" "$timeout" "$timeout_flag" || status=$?
+
+    local timed_out=0
+    [ -f "$timeout_flag" ] && timed_out=1
+
+    local entries
+    entries=$(wpmcp_code_read_log "$log_file")
+
+    wpmcp_code_render \
+        "$entries" "$out_file" "$err_file" "$status" "$timed_out" \
+        "$dry_run" "$read_only" "$timeout" "$WPMCP_ACTIVE_SITE" \
+        "${WPMCP_ACTIVE_ORIGIN:-}" "$sha"
+}

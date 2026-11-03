@@ -14,26 +14,28 @@
 
 wpmcp_output_envelope_ok() {
     # wpmcp_output_envelope_ok <body>
+    # The body is passed to jq on stdin so it never appears in jq's argv.
     local body="$1"
     local site origin
     site="${WPMCP_ACTIVE_SITE:-}"
     origin="${WPMCP_ACTIVE_ORIGIN:-}"
 
-    # Wrap the raw body as the `data` field.
-    local data
     if [ -z "$body" ]; then
-        data="null"
-    elif echo "$body" | jq -e . >/dev/null 2>&1; then
-        data=$(echo "$body" | jq -c .)
+        printf 'null' | jq -c \
+            --arg site "$site" \
+            --arg origin "$origin" \
+            '{ok:true,data:.,meta:{site:$site,origin:$origin}}'
+    elif printf '%s' "$body" | jq -c . >/dev/null 2>&1; then
+        printf '%s' "$body" | jq -c \
+            --arg site "$site" \
+            --arg origin "$origin" \
+            '{ok:true,data:.,meta:{site:$site,origin:$origin}}'
     else
-        data=$(jq -n --arg s "$body" '$s')
+        printf '%s' "$body" | jq -Rsc \
+            --arg site "$site" \
+            --arg origin "$origin" \
+            '{ok:true,data:.,meta:{site:$site,origin:$origin}}'
     fi
-
-    jq -nc \
-        --argjson data "$data" \
-        --arg site "$site" \
-        --arg origin "$origin" \
-        '{ok:true,data:$data,meta:{site:$site,origin:$origin}}'
 }
 
 wpmcp_output_envelope_err() {

@@ -15,9 +15,8 @@ wpmcp_discover() {
     local all_abilities="[]"
     while :; do
         local url="${rest_url}?per_page=100&page=${page}"
-        local raw
-        raw=$(wpmcp_http_get "$url")
-        local rc=$?
+        local raw rc=0
+        raw=$(wpmcp_http_get "$url") || rc=$?
         if [ $rc -ne 0 ]; then
             wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
                 "Failed to fetch $url (curl exit $rc)"
@@ -33,7 +32,7 @@ wpmcp_discover() {
         if [ "$n" -eq 0 ]; then
             break
         fi
-        all_abilities=$(jq -nc --argjson a "$all_abilities" --argjson b "$body" '$a + $b')
+        all_abilities=$(printf '%s\n%s' "$all_abilities" "$body" | jq -sc '.[0] + .[1]')
         if [ "$n" -lt 100 ]; then
             break
         fi
@@ -45,11 +44,10 @@ wpmcp_discover() {
     done
 
     if [ "$WPMCP_JSON" = "1" ]; then
-        jq -nc \
-            --argjson abilities "$all_abilities" \
+        printf '%s' "$all_abilities" | jq -c \
             --arg site "$WPMCP_ACTIVE_SITE" \
             --arg origin "$WPMCP_ACTIVE_ORIGIN" \
-            '{ok:true,data:{abilities:$abilities},meta:{site:$site,origin:$origin,count:($abilities|length)}}'
+            '{ok:true,data:{abilities:.},meta:{site:$site,origin:$origin,count:(.|length)}}'
         return 0
     fi
 

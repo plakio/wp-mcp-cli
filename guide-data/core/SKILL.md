@@ -32,6 +32,30 @@ wp-mcp --json describe wp-mcp/list-directory | jq '.data.input_schema'
 wp-mcp run wp-mcp/list-directory --input '{"path":"/Users"}'
 ```
 
+## Code mode (multi-step work)
+
+For loops, pagination, audits or batch updates, write a local PHP script:
+
+```php
+<?php
+$rows = wp_mcp_search('post', 10);
+foreach ($rows as $row) {
+    echo $row['name'] . "\n";
+}
+```
+
+```bash
+# Real reads, all writes stubbed. Review the plan.
+wp-mcp code audit.php --read-only
+
+# Execute only after explicit approval.
+wp-mcp code audit.php --yes
+```
+
+The script runs on the local machine, not the WordPress site, and is not a
+sandbox. Use `--max-calls` and `--timeout` for large scripts. See
+`skills/wp-mcp/SKILL.md` for the full code-mode workflow.
+
 ## Rules of engagement
 
 - **Never narrate** the setup steps to the user. Run them silently and
@@ -39,6 +63,8 @@ wp-mcp run wp-mcp/list-directory --input '{"path":"/Users"}'
 - **Never auto-confirm** destructive operations. Pass `--yes` only when
   the user explicitly approved.
 - **Prefer `--json`** for any output the agent will parse.
+- **For multi-step work**, use `wp-mcp code --read-only` to build a plan from
+  real data, then `--yes` only after explicit approval.
 - **Branch on `error.code`** rather than parsing `error.message`.
 - **Site selection**: do not assume a profile. Use `wp-mcp --json sites list`
   to discover the available sites, then pick one explicitly with `--site`

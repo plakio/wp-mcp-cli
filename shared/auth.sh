@@ -21,12 +21,18 @@ wpmcp_auth_save() {
     cred_path=$(wpmcp_auth_cred_path "$site")
     local tmp="${cred_path}.tmp.$$"
     umask 077
-    jq -n \
+    # Feed the password to jq on STDIN (-Rs reads it as one raw string) so it
+    # never appears in jq's argv.
+    local rc=0
+    printf '%s' "$pass" | jq -Rs \
         --arg user "$user" \
-        --arg pass "$pass" \
         --arg site "$site" \
-        '{site:$site,username:$user,app_password:$pass,created_at:now|todate}' \
-        > "$tmp"
+        '{site:$site,username:$user,app_password:.,created_at:now|todate}' \
+        > "$tmp" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$tmp"
+        return "$rc"
+    fi
     chmod 600 "$tmp"
     mv -f "$tmp" "$cred_path"
 }
@@ -74,7 +80,10 @@ wpmcp_auth_require() {
     fi
     local cred
     cred=$(wpmcp_auth_load "$WPMCP_ACTIVE_SITE")
-    WPMCP_ACTIVE_USER=$(echo "$cred" | jq -r '.username')
-    WPMCP_ACTIVE_PASS=$(echo "$cred" | jq -r '.app_password')
-    export WPMCP_ACTIVE_USER WPMCP_ACTIVE_PASS
+    WPMCP_ACTIVE_USER=$(printf '%s' "$cred" | jq -r '.username')
+    WPMCP_ACTIVE_PASS=$(printf '%s' "$cred" | jq -r '.app_password')
+    # Keep the application password in this shell only. Command substitutions
+    # and subshells still see it, but external processes (curl, jq, PHP) do not.
+    export -n WPMCP_ACTIVE_PASS 2>/dev/null || true
+    export WPMCP_ACTIVE_USER
 }

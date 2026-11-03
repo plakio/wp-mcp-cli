@@ -66,8 +66,9 @@ wpmcp_run() {
         esac
     fi
 
-    # Validate JSON before posting.
-    if [ "$input_json" != "null" ] && ! printf '%s' "$input_json" | jq -e . >/dev/null 2>&1; then
+    # Validate JSON before posting. `jq -e` treats valid null/false as
+    # failures, so use a plain parse check instead.
+    if [ "$input_json" != "null" ] && ! printf '%s' "$input_json" | jq -c . >/dev/null 2>&1; then
         wpmcp_error_print "usage_error" "$WPMCP_ERROR_USAGE" \
             "--input is not valid JSON"
     fi
@@ -89,9 +90,9 @@ wpmcp_run() {
     if [ "$yes" != "1" ] && [ "$WPMCP_JSON" != "1" ]; then
         local describe_url
         describe_url=$(wpmcp_rest_url_for "/wp-abilities/v1/abilities/${encoded}")
-        local describe_raw
-        describe_raw=$(wpmcp_http_get "$describe_url")
-        if [ $? -eq 0 ]; then
+        local describe_raw describe_rc=0
+        describe_raw=$(wpmcp_http_get "$describe_url") || describe_rc=$?
+        if [ "$describe_rc" -eq 0 ]; then
             wpmcp_http_split "$describe_raw"
             local destructive
             destructive=$(printf '%s' "$WPMCP_HTTP_BODY" | jq -r '.meta.annotations.destructive // false')
@@ -104,14 +105,14 @@ wpmcp_run() {
         fi
     fi
 
-    # POST the request.
+    # POST the request. Build the body on stdin so large inputs never hit
+    # ARG_MAX and do not appear in jq/curl process arguments.
     local body
-    body=$(jq -nc --argjson input "$input_json" '{input:$input}')
+    body=$(printf '%s' "$input_json" | jq -c '{input: .}')
 
-    local raw
-    raw=$(wpmcp_http_post_json "$rest_url" "$body")
-    local rc=$?
-    if [ $rc -ne 0 ]; then
+    local raw rc=0
+    raw=$(wpmcp_http_post_json "$rest_url" "$body") || rc=$?
+    if [ "$rc" -ne 0 ]; then
         wpmcp_error_print "network_error" "$WPMCP_ERROR_NETWORK" \
             "Failed to POST $rest_url (curl exit $rc)"
     fi
@@ -120,17 +121,35 @@ wpmcp_run() {
         wpmcp_http_classify_wp_error "$WPMCP_HTTP_BODY"
     fi
 
-    local resp_body
-    resp_body=$(printf '%s' "$WPMCP_HTTP_BODY" | jq -c . 2>/dev/null || printf '%s' "$WPMCP_HTTP_BODY")
+    # Normalize the body through stdin. `resp_norm` is empty for invalid
+    # JSON; an empty HTTP body is treated as null.
+    local resp_body="$WPMCP_HTTP_BODY"
+    local resp_norm=""
+    resp_norm=$(printf '%s' "$resp_body" | jq -c . 2>/dev/null) || true
+    local resp_is_json=0
+    if [ -n "$resp_norm" ]; then
+        resp_body="$resp_norm"
+        resp_is_json=1
+    elif [ -z "$resp_body" ]; then
+        resp_body="null"
+        resp_is_json=1
+    fi
 
     if [ "$WPMCP_JSON" = "1" ]; then
-        jq -nc \
-            --argjson data "$resp_body" \
-            --arg site "$WPMCP_ACTIVE_SITE" \
-            '{ok:true,data:$data,meta:{site:$site}}'
+        if [ "$resp_is_json" = "1" ]; then
+            printf '%s' "$resp_body" | jq -c \
+                --arg site "$WPMCP_ACTIVE_SITE" \
+                --arg status "${WPMCP_HTTP_STATUS:-200}" \
+                '{ok:true,data:.,meta:{site:$site,http_status:($status|tonumber)}}'
+        else
+            printf '%s' "$resp_body" | jq -Rsc \
+                --arg site "$WPMCP_ACTIVE_SITE" \
+                --arg status "${WPMCP_HTTP_STATUS:-200}" \
+                '{ok:true,data:.,meta:{site:$site,http_status:($status|tonumber)}}'
+        fi
     else
-        if echo "$resp_body" | jq -e . >/dev/null 2>&1; then
-            echo "$resp_body" | jq .
+        if [ "$resp_is_json" = "1" ]; then
+            printf '%s' "$resp_body" | jq .
         else
             printf '%s\n' "$resp_body"
         fi

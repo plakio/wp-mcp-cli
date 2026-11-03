@@ -8,6 +8,16 @@
 
 set -euo pipefail
 
+# Never inherit an exported application password from a parent process.
+# Older releases exported it; keep it out of child environments.
+unset WPMCP_ACTIVE_PASS
+
+# Capture the auth-login password fallback and remove it from the environment
+# so it cannot reach child processes (curl, jq, PHP). The value stays in a
+# non-exported shell variable for `auth login`.
+WPMCP_PASSWORD_INPUT="${WPMCP_PASSWORD:-}"
+unset WPMCP_PASSWORD
+
 WPMCP_NAME="wp-mcp"
 WPMCP_VERSION="0.1.9"
 WPMCP_HOME="${WPMCP_HOME:-$HOME/.wp-mcp}"
@@ -80,6 +90,7 @@ Commands:
   discover    List available abilities on the active site
   describe    Show an ability's schema and metadata
   run         Execute an ability on the active site
+  code        Run a local PHP script that calls abilities
   doctor      Diagnose wp-mcp-cli and target site connectivity
   skill       Install the wp-mcp agent skill
   version     Show wp-mcp-cli version
@@ -104,6 +115,7 @@ Examples:
   wp-mcp --json discover
   wp-mcp describe wp-mcp/list-directory
   wp-mcp run wp-mcp/list-directory --input '{"path":"/Users"}'
+  wp-mcp code audit.php --read-only
   wp-mcp --json doctor
 
 HELP
@@ -173,6 +185,44 @@ The --input flag accepts:
 
 Use --yes to skip the destructive-operation prompt. Use --json for a
 stable envelope on STDOUT.
+HELP
+            ;;
+        code)
+            cat <<'HELP'
+Usage:
+  wp-mcp code <file|-> [flags]
+
+Runs a local PHP script that calls WP-MCP abilities through the CLI's
+existing REST path. The script runs on your machine; it is not a sandbox.
+
+Modes:
+  (default)       execute reads and non-destructive writes. Destructive
+                  abilities require --yes.
+  --read-only     execute only abilities marked readonly=true; stub writes.
+  --dry-run       stub every ability call; metadata search/describe still run.
+  --yes, -y       allow destructive abilities. It does not inject the
+                  ability's confirm_* arguments; pass them explicitly.
+
+Flags:
+  --max-calls <n>  Maximum ability calls (1-1000, default 100).
+  --timeout <sec>  Wall-clock limit (1-3600, default 120).
+  --verbose        Print one line per call in human mode.
+  --help, -h       Show this help.
+
+Script API:
+  wp_mcp_call($ability, $input = null)
+  wp_mcp_search($query, $limit = 10, $cursor = null)
+  wp_mcp_discover($options = [])
+  wp_mcp_describe($ability)
+  wp_mcp_log($message)
+  wp_mcp_is_dry_run()
+  wp_mcp_is_read_only()
+  wp_mcp_site()
+
+Examples:
+  wp-mcp code audit.php --read-only
+  wp-mcp code migrate.php --dry-run
+  wp-mcp code migrate.php --yes
 HELP
             ;;
         doctor)
@@ -286,6 +336,9 @@ main() {
             ;;
         run)
             wpmcp_run "$@"
+            ;;
+        code)
+            wpmcp_code "$@"
             ;;
         doctor)
             wpmcp_doctor "$@"

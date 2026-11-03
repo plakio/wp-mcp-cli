@@ -33,6 +33,7 @@ Adding a new ability (`wp_register_ability()` with `meta.show_in_rest => true`) 
 - `gum` — `brew install gum` or `pacman -S gum`
 - `jq` — `brew install jq`
 - `curl`
+- `php` ≥ 8.0 — only for `wp-mcp code`
 
 ## Installation
 
@@ -77,11 +78,50 @@ wp-mcp sites rename <name> <new-name>
 wp-mcp discover                               # list every ability on the active site
 wp-mcp describe <ability>                     # show schema + annotations
 wp-mcp run <ability> --input <json|@file|-> [--yes]
+wp-mcp code <file|-> [--dry-run|--read-only|--yes]
 
 wp-mcp doctor [--offline]                     # health checks
 wp-mcp skill install [codex|claude-code|opencode|hermes|pi|global|all]
 wp-mcp version
 ```
+
+## Code mode
+
+`wp-mcp code` runs a local PHP script that calls abilities through the same
+REST path as `wp-mcp run`. The script runs on your machine; it is **not** a
+sandbox, and it has your local user's permissions. Use it for loops,
+pagination, audits and batch work where intermediate data should not flow
+through the model.
+
+```php
+<?php
+$rows = wp_mcp_search('post', 5);
+foreach ($rows as $row) {
+    echo $row['name'] . "\n";
+}
+```
+
+```bash
+# Reads execute; every write is stubbed and logged.
+wp-mcp code migrate.php --read-only
+
+# Review the plan, then execute it.
+wp-mcp code migrate.php --yes
+```
+
+Modes:
+
+| Mode | Reads (`readonly=true`) | Non-destructive writes | Destructive writes |
+| ---- | ----------------------- | ---------------------- | ------------------ |
+| default | execute | execute | exit 6 unless `--yes` |
+| `--read-only` | execute | stub | stub |
+| `--dry-run` | stub | stub | stub |
+| `--yes` | execute | execute | execute |
+
+`--dry-run` still performs metadata calls (`wp_mcp_search` / `wp_mcp_describe`).
+Use `--read-only` when the plan needs real data. The CLI does not pass the
+application password to the script or its child processes; the script reaches
+the site through the same `wp-mcp run` path.
 
 ## Global flags
 
@@ -99,7 +139,7 @@ wp-mcp version
 | 2    | usage error / `site_required` / `site_not_found` / `ability_not_found` |
 | 3    | `auth_required` / `auth_denied` / `auth_expired`    |
 | 4    | `network_error` / `rest_error` / `server_unsupported` |
-| 5    | `ability_execution_failed` / `schema_validation_failed` |
+| 5    | `ability_execution_failed` / `schema_validation_failed` / `script_error` / `call_budget_exceeded` |
 | 6    | `confirmation_required` (destructive without `--yes`) |
 
 ## JSON envelopes
@@ -118,13 +158,24 @@ Error (STDERR in `--json` mode):
 
 ```
 main              # globals, setup, command router
-shared/           # shared helpers (paths, config, auth, http, output, ui, url)
-commands/         # command functions (auth, sites, discover, describe, run, doctor, skill)
+shared/           # shared helpers (paths, config, auth, http, output, ui, url, code)
+commands/         # command functions (auth, sites, discover, describe, run, code, doctor, skill)
 compile.sh        # builds wp-mcp.sh
 install.sh        # local installer
-docs/             # contract + homebrew maintenance
+docs/             # contract + code mode + homebrew maintenance
 skills/wp-mcp/    # agent skill
 guide-data/       # bundled guides
+tests/            # hardening, code mode and live-site smoke tests
+```
+
+## Development
+
+```bash
+./compile.sh
+bash -n main shared/*.sh commands/*
+./tests/hardening.sh   # no site required
+./tests/code.sh        # no site required
+./tests/smoke.sh       # requires WPMCP_TEST_URL/USER/PASSWORD
 ```
 
 ## License
@@ -135,5 +186,6 @@ GNU Affero General Public License v3 or later. See `LICENSE`.
 
 - [docs/homebrew.md](docs/homebrew.md) — release & tap maintenance.
 - [docs/v1-contract.md](docs/v1-contract.md) — stable contract reference.
+- [docs/code-mode.md](docs/code-mode.md) — code mode design and mode semantics.
 - [skills/wp-mcp/SKILL.md](skills/wp-mcp/SKILL.md) — the agent skill.
 - [guide-data/core/SKILL.md](guide-data/core/SKILL.md) — the canonical agent workflow.
