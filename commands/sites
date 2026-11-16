@@ -42,7 +42,7 @@ wpmcp_sites_list() {
         return 0
     fi
 
-    if wpmcp_has_tty; then
+    if wpmcp_stdout_is_tty; then
         # gum's --columns provides the column headers; the data on
         # stdin must contain ONLY data rows, not a header line.
         local tsv=""

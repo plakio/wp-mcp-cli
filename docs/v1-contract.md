@@ -96,9 +96,12 @@ the interactive prompt when that matters.)
 | `WPMCP_UPDATE_CHECK` | Reserved for future use. |
 | `WPMCP_CREDENTIAL_BACKEND` | Reserved for future use. |
 
-In non-TTY mode the CLI never auto-prompts. Missing required values
-produce one consolidated `usage_error` exit 2 listing every missing
-input (with the exact flag or env var to set).
+Interactive prompts require a controlling terminal (`/dev/tty`). Prompt UI and
+keystrokes use `/dev/tty`, so redirecting STDOUT (for example, piping `--json`
+output) does not disable them or mix prompt text into the data stream. When no
+controlling terminal is available (CI, cron, agents), the CLI never
+auto-prompts. Missing required values produce one consolidated `usage_error`
+exit 2 listing every missing input (with the exact flag or env var to set).
 
 
 

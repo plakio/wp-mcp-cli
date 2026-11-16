@@ -177,7 +177,7 @@ install.sh        # local installer
 docs/             # contract + code mode + homebrew maintenance
 skills/wp-mcp/    # agent skill
 guide-data/       # bundled guides
-tests/            # hardening, skill installer, code mode and live-site smoke tests
+tests/            # hardening, interactive, skill installer, code mode and live-site smoke tests
 ```
 
 ## Development
@@ -188,6 +188,7 @@ bash -n main shared/*.sh commands/*
 ./tests/hardening.sh   # no site required
 ./tests/code.sh        # no site required (PHP, Python and Node clients)
 ./tests/skill.sh       # no site or network required
+./tests/interactive.sh # no site required (needs python3 for the PTY harness)
 ./tests/smoke.sh       # requires WPMCP_TEST_URL/USER/PASSWORD
 ```
 

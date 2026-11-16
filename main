@@ -49,8 +49,27 @@ wpmcp_command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# True when the process has a controlling terminal. This is what interactive
+# prompts need. It deliberately does not require stdout to be a TTY: users
+# frequently redirect stdout (`wp-mcp auth login > log` or `| jq`) while
+# still typing on the terminal. cron, CI and most agents have no controlling
+# terminal, so /dev/tty cannot be opened there.
+wpmcp_has_controlling_tty() {
+    ( : </dev/tty >/dev/tty ) 2>/dev/null
+}
+
+# Interactive prompts are possible when a controlling terminal exists.
+# Keep honoring an inherited stdin TTY as a fallback for unusual setups
+# where /dev/tty is unavailable but stdin is still attached to a terminal.
 wpmcp_has_tty() {
-    [ -t 0 ] && [ -t 1 ]
+    wpmcp_has_controlling_tty || [ -t 0 ]
+}
+
+# Decorative output (gum tables, pagers) writes to stdout, so it must only
+# run when stdout is a terminal. Prompts use /dev/tty instead and are not
+# affected by this check.
+wpmcp_stdout_is_tty() {
+    [ -t 1 ]
 }
 
 wpmcp_require_command() {

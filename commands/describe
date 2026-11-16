@@ -58,7 +58,7 @@ wpmcp_describe() {
         return 0
     fi
 
-    if wpmcp_command_exists gum && wpmcp_has_tty; then
+    if wpmcp_command_exists gum && wpmcp_stdout_is_tty; then
         printf '%s' "$body" | gum pager --border rounded
     else
         printf '%s' "$body" | jq .

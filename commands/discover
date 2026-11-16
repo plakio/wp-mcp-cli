@@ -51,7 +51,7 @@ wpmcp_discover() {
         return 0
     fi
 
-    if wpmcp_has_tty; then
+    if wpmcp_stdout_is_tty; then
         local labels
         labels=$(printf '%s' "$all_abilities" | jq -r '.[] | [.name, (.label // ""), (.category // ""), (.meta.annotations.readonly // false|tostring), (.meta.annotations.destructive // false|tostring)] | @tsv')
         # gum's --columns supplies the header; stdin contains ONLY rows.

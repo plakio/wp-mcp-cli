@@ -63,3 +63,6 @@ jobs:
 
       - name: Run skill installer tests
         run: ./tests/skill.sh
+
+      - name: Run interactive terminal tests
+        run: ./tests/interactive.sh

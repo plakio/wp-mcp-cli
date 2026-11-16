@@ -184,6 +184,7 @@ bash -n main shared/* commands/* compile.sh install.sh tests/*.sh wp-mcp.sh
 ./tests/hardening.sh
 ./tests/code.sh
 ./tests/skill.sh
+./tests/interactive.sh
 
 # 4. Commit + push.
 git add main wp-mcp.sh

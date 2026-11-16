@@ -49,8 +49,27 @@ wpmcp_command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# True when the process has a controlling terminal. This is what interactive
+# prompts need. It deliberately does not require stdout to be a TTY: users
+# frequently redirect stdout (`wp-mcp auth login > log` or `| jq`) while
+# still typing on the terminal. cron, CI and most agents have no controlling
+# terminal, so /dev/tty cannot be opened there.
+wpmcp_has_controlling_tty() {
+    ( : </dev/tty >/dev/tty ) 2>/dev/null
+}
+
+# Interactive prompts are possible when a controlling terminal exists.
+# Keep honoring an inherited stdin TTY as a fallback for unusual setups
+# where /dev/tty is unavailable but stdin is still attached to a terminal.
 wpmcp_has_tty() {
-    [ -t 0 ] && [ -t 1 ]
+    wpmcp_has_controlling_tty || [ -t 0 ]
+}
+
+# Decorative output (gum tables, pagers) writes to stdout, so it must only
+# run when stdout is a terminal. Prompts use /dev/tty instead and are not
+# affected by this check.
+wpmcp_stdout_is_tty() {
+    [ -t 1 ]
 }
 
 wpmcp_require_command() {
@@ -2546,13 +2565,30 @@ wpmcp_paths_ensure() {
 # SPDX-FileCopyrightText: 2026 Plak Solutions S.A.C. <info@plak.io>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# gum wrappers. Every helper checks for a TTY first and falls back to
-# stdin/flags/env when no TTY is available, so commands remain usable
-# in CI and from coding agents.
+# gum wrappers. Prompt helpers check for a controlling terminal first and
+# attach gum's TUI to /dev/tty, so they keep working when stdout is
+# redirected and never leak prompt output into JSON or piped data. Decorative
+# helpers (tables, pagers) require stdout to be a TTY and fall back to plain
+# text otherwise. No helper prompts in CI, cron or agents without a
+# controlling terminal.
 #
 # The second positional argument is the "flag hint" — a short string
 # (e.g. "--user", "WPMCP_USERNAME") that the error message includes so
 # the caller knows exactly which mechanism to use in non-TTY mode.
+
+wpmcp_ui_gum() {
+    # wpmcp_ui_gum <gum args...>
+    # gum reads keystrokes from stdin and draws the prompt on stderr; the
+    # entered value (or confirm status) stays on stdout so callers can
+    # capture it. Point both streams at the controlling terminal so a
+    # redirected stdout neither hides the prompt nor makes gum abort with an
+    # unknown terminal width.
+    if wpmcp_has_controlling_tty; then
+        gum "$@" </dev/tty 2>/dev/tty
+    else
+        gum "$@"
+    fi
+}
 
 wpmcp_ui_input() {
     # wpmcp_ui_input <prompt> <flag_hint> [<default>] [env_var]
@@ -2574,11 +2610,11 @@ wpmcp_ui_input() {
         wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag${env_var:+ or set $env_var}."
     fi
     wpmcp_require_gum
-    local args=(--prompt "$prompt" --prompt.foreground 212)
+    local gum_args=(--prompt "$prompt" --prompt.foreground 212)
     if [ -n "$default" ]; then
-        args+=(--value "$default")
+        gum_args+=(--value "$default")
     fi
-    gum input "${args[@]}"
+    wpmcp_ui_gum input "${gum_args[@]}"
 }
 
 wpmcp_ui_password() {
@@ -2596,7 +2632,7 @@ wpmcp_ui_password() {
         wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag${env_var:+ or set $env_var}."
     fi
     wpmcp_require_gum
-    gum input --password --prompt "$prompt" --prompt.foreground 212
+    wpmcp_ui_gum input --password --prompt "$prompt" --prompt.foreground 212
 }
 
 wpmcp_ui_confirm() {
@@ -2608,13 +2644,15 @@ wpmcp_ui_confirm() {
             "$prompt (pass --yes to confirm)"
     fi
     wpmcp_require_gum
-    local args=(--prompt "$prompt" --affirmative "Yes" --negative "No")
+    # gum confirm takes the prompt as a positional argument. It has no
+    # --prompt flag; passing one makes gum print help on stdout and cancel.
+    local args=("$prompt" --affirmative "Yes" --negative "No")
     if [ "$default_yes" = "true" ]; then
         args+=(--default=true)
     else
         args+=(--default=false)
     fi
-    gum confirm "${args[@]}"
+    wpmcp_ui_gum confirm "${args[@]}"
 }
 
 wpmcp_ui_choose() {
@@ -2626,15 +2664,17 @@ wpmcp_ui_choose() {
         wpmcp_error_usage "Missing $prompt. Pass '$flag_hint' as a flag."
     fi
     wpmcp_require_gum
-    printf '%s\n' "$@" | gum choose --prompt "$prompt" --header "$prompt"
+    # Options are passed as arguments so the helper can reserve stdin for
+    # keystrokes from /dev/tty.
+    wpmcp_ui_gum choose --prompt "$prompt" --header "$prompt" "$@"
 }
 
 wpmcp_ui_table() {
     # wpmcp_ui_table <tsv_data> [<columns_comma_separated>]
     local tsv="$1"
     local columns="${2:-}"
-    if ! wpmcp_has_tty; then
-        # In non-TTY contexts, print TSV plain for piping into other tools.
+    if ! wpmcp_stdout_is_tty; then
+        # When stdout is a pipe or file, print TSV plain for other tools.
         printf '%s\n' "$tsv"
         return 0
     fi
@@ -3318,7 +3358,7 @@ wpmcp_describe() {
         return 0
     fi
 
-    if wpmcp_command_exists gum && wpmcp_has_tty; then
+    if wpmcp_command_exists gum && wpmcp_stdout_is_tty; then
         printf '%s' "$body" | gum pager --border rounded
     else
         printf '%s' "$body" | jq .
@@ -3379,7 +3419,7 @@ wpmcp_discover() {
         return 0
     fi
 
-    if wpmcp_has_tty; then
+    if wpmcp_stdout_is_tty; then
         local labels
         labels=$(printf '%s' "$all_abilities" | jq -r '.[] | [.name, (.label // ""), (.category // ""), (.meta.annotations.readonly // false|tostring), (.meta.annotations.destructive // false|tostring)] | @tsv')
         # gum's --columns supplies the header; stdin contains ONLY rows.
@@ -3748,7 +3788,7 @@ wpmcp_sites_list() {
         return 0
     fi
 
-    if wpmcp_has_tty; then
+    if wpmcp_stdout_is_tty; then
         # gum's --columns provides the column headers; the data on
         # stdin must contain ONLY data rows, not a header line.
         local tsv=""
